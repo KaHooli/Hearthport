@@ -12,6 +12,8 @@
 | G6 | OIDC is configured in the web UI by admins | Admin → Authentication settings page, with a "Test & confirm" step (§4.2) |
 | G7 | After OIDC is confirmed, OIDC is the only way to log in | The local login form and endpoint are disabled when a confirmed OIDC config exists… |
 | G8 | …unless an env var re-enables username/password | …or when `HEARTHPORT_ENABLE_LOCAL_LOGIN=true` is set (§4.3) |
+| G9 | Only users Authentik allows to use Hearthport can sign in | Authentik's policy bindings on the Hearthport application, re-checked by Hearthport at login and on every app-list refresh (§4.5) |
+| G10 | Admins can share extra links on the dashboard | Admin-managed custom links, shown to all signed-in users or only to chosen Authentik groups (§5.1) |
 
 ### Non-goals (v1)
 - Acting as a reverse proxy or forward-auth provider (Authentik's outposts already do this).
@@ -31,9 +33,8 @@
 | Secret encryption at rest | AES-256-GCM | Protects the OIDC client secret and Authentik API token in the DB |
 | Container | Multi-stage build → `gcr.io/distroless/static:nonroot` | Small image with little attack surface; runs as a non-root user |
 
-A SPA (Svelte or React) is an alternative if the dashboard later needs rich
-interactivity. The API is designed so one could be added without changing the
-backend.
+**Decision:** Go + htmx. A SPA (Svelte or React) could be added later if the
+dashboard needs richer interactivity, without changing the backend.
 
 ## 3. Architecture
 
@@ -116,13 +117,14 @@ Admin → Authentication page fields:
 - Scopes (default `openid profile email groups`; see §5)
 - Claim mappings: username (`preferred_username`), display name (`name`), email, groups (`groups`)
 - **Admin group(s)**: Authentik group names whose members become Hearthport admins (e.g. `hearthport-admins`)
-- Authentik API settings for app discovery (§5): base URL, API token (encrypted)
+- Authentik API settings for app discovery (§5): base URL, service-account API token (encrypted)
+- Hearthport's application slug in Authentik (default `hearthport`), used for the access check in §4.5
 - Read-only: the redirect URI to paste into Authentik (`{BASE_URL}/auth/oidc/callback`)
 
 **Test & confirm flow** (stops admins locking themselves out):
 1. The admin clicks *Test & confirm*. Hearthport runs discovery and shows any errors inline.
 2. The browser is sent through a real OIDC login using the draft settings.
-3. On callback Hearthport verifies the ID token, extracts the claims, and checks that the authenticated user **matches an admin group**. It also checks that the Authentik API credentials can list applications.
+3. On callback Hearthport verifies the ID token, extracts the claims, and checks that the authenticated user **matches an admin group**. It also checks that the Authentik API service-account token can list applications for that user, and that the Hearthport application itself is in that list (§4.5).
 4. The results page shows the received claims, the role that would be assigned, and the number of apps discovered.
 5. Only if every check passes can the admin click **Confirm**. The state becomes `confirmed` and local login is switched off from then on (existing sessions stay valid until they expire).
 6. Editing a confirmed config saves it as a new draft. The confirmed config stays active until the new draft is itself tested and confirmed.
@@ -150,9 +152,18 @@ Login-method truth table:
 - Authorization Code + **PKCE (S256)**, random `state` and `nonce` stored in a short-lived signed pre-auth cookie.
 - ID token is verified (issuer, audience, expiry, nonce, signature via JWKS).
 - Roles: `admin` if any configured admin group is in the `groups` claim, otherwise `user`. Roles are re-evaluated on every login and never stored permanently.
-- Session stores: subject, username, display name, email, groups, role, and the access/refresh tokens (encrypted) if the delegated discovery mode is used.
+- Session stores: subject, username, display name, email, groups, role, and the Authentik user `pk`. User access/refresh tokens are not kept after login.
 - **Logout**: destroys the local session, then redirects to Authentik's `end_session_endpoint` with `id_token_hint` and `post_logout_redirect_uri`.
 - Optional (v1.1): back-channel logout endpoint.
+
+### 4.5 Who can sign in
+
+Any Authentik user whose access to the Hearthport application is allowed in Authentik can sign in. Hearthport has no user list of its own.
+
+- **Main gate, in Authentik:** the admin binds users, groups or policies to the Hearthport application in Authentik. Authentik refuses the authorization request for anyone else, so they never reach Hearthport's callback.
+- **Second check, in Hearthport:** at the OIDC callback, Hearthport fetches the user's permitted applications (§5). If the Hearthport application slug is not in the list, it shows a "you don't have access" page and creates no session. This catches mistakes such as the Hearthport application having no bindings at all, which Authentik treats as "allow everyone".
+- **Revocation:** on each app-list refresh (cache TTL, §5), if Hearthport's own slug has disappeared from the user's list, the session is ended and the user is sent to `/login`.
+- `admin` vs `user` role is decided separately by the admin group(s) (§4.4). Access to Hearthport doesn't depend on group names configured in Hearthport.
 
 ## 5. App discovery: "only show apps the user can access"
 
@@ -161,29 +172,36 @@ application's policy/group/user bindings. Its own *My applications* page uses
 `GET /api/v3/core/applications/`, which returns only the apps the requesting
 user can access. Hearthport reuses that decision instead of copying policies.
 
-Two supported modes, chosen in the admin UI:
-
-**Mode A: Service-account token (default, recommended)**
-- Admin creates an Authentik service account + API token with permission to view applications and users.
+**Decision: service-account token.**
+- The admin creates an Authentik service account and an API token for it, with permission to view applications and users (minimum permissions to be confirmed in the Phase 0 spike).
 - Hearthport calls `GET /api/v3/core/applications/?for_user=<pk>&page_size=100` (following pagination), where `<pk>` is the Authentik user ID.
-- The user's `pk` is found by `GET /api/v3/core/users/?username=<preferred_username>` (cached), or read directly from a custom `ak_user_pk` claim added via an Authentik scope mapping.
-- Pros: user tokens never gain API access; works the same for all users.
-
-**Mode B: Delegated user token**
-- Add Authentik's `goauthentik.io/api` scope to the Hearthport provider and request it at login. The user's access token is then used to call `GET /api/v3/core/applications/` directly.
-- Pros: no service account; results are exactly what the user sees in Authentik.
-- Cons: the portal holds a token with API access as that user (significant for Authentik admins), so tokens must be refreshed and stored encrypted.
+- The user's `pk` is found by `GET /api/v3/core/users/?username=<preferred_username>` at login and stored in the session. If a custom `ak_user_pk` claim is added via an Authentik scope mapping, it is used instead.
+- User tokens never get API access, and the behaviour is the same for every user.
+- Not planned for v1: using the user's own token (via Authentik's `goauthentik.io/api` scope). It would give the portal API access as each user, which is too powerful for Authentik admins.
 
 > **Spike (Phase 0):** confirm, against the target Authentik version, that `for_user` gives the same results as the user's own library view (including `superuser_full_list` behaviour for Authentik superusers), and the minimum permissions the service account needs.
 
 Handling the results:
 - Fields used: `name`, `slug`, `group`, `meta_launch_url` (falls back to the provider's launch URL), `meta_icon`, `meta_description`, `meta_publisher`, `open_in_new_tab`.
-- Apps with no launch URL are skipped. The Hearthport app itself is hidden.
+- Apps with no launch URL are skipped. The Hearthport app itself is hidden, but its presence is used for the access check (§4.5).
 - Icons: relative `meta_icon` paths are resolved against the Authentik base URL. Optionally Hearthport proxies and caches icons so the browser never calls Authentik's API directly.
 - **Cache**: per-user, in memory, TTL 60s (configurable), cleared on login. A "refresh" button bypasses it.
 - **Failure mode**: if Authentik is unreachable, show the last cached list with a stale badge. If there is no cache, show an error. Never fall back to showing all apps.
 
 **Local presentation overrides** (admin UI, v1.1): per-app slug overrides for display order, category, icon, hidden flag, and pinned/favourite. These can only **hide or restyle** apps. They can never grant access to an app Authentik did not return.
+
+### 5.1 Custom links
+
+Admins can add links that aren't Authentik applications, such as docs, a status page or external bookmarks. They are shown on the dashboard alongside the Authentik apps.
+
+- **Fields:** name, URL, description, icon (uploaded image, image URL, or a built-in icon name), category, sort order, open-in-new-tab, enabled.
+- **Who sees each link:**
+  - *All signed-in users* (default), or
+  - *Only members of selected Authentik groups*, matched against the `groups` claim at login. A user in any selected group sees the link.
+- **Display:** custom links are sorted into categories with the Authentik apps. A category name used by both is merged into one section. Tiles look the same, with a small "link" marker so users can tell they don't come from Authentik.
+- **Validation:** only `http://` and `https://` URLs are accepted (no `javascript:` or `data:`). Names and descriptions are escaped as plain text. Icon uploads follow the same rules as logo uploads (§9).
+- Custom links are stored in Hearthport's database and never sent to Authentik. They aren't shown if Authentik is unreachable and the app list can't be loaded, because the access check in §4.5 can't run.
+- **Admin UI:** `/admin/links` lists, adds, edits, reorders (drag or up/down) and enables or disables links. A "preview as group" option shows which links a given group would see.
 
 ## 6. UI / pages
 
@@ -194,10 +212,11 @@ Handling the results:
 | `GET /auth/oidc/start` | Public | Begin OIDC flow |
 | `GET /auth/oidc/callback` | Public | Complete OIDC flow (normal login or admin test) |
 | `POST /logout` | Session | Logout (+ RP-initiated logout at Authentik) |
-| `GET /` | User | Dashboard: app tiles grouped by Authentik `group`, search/filter |
+| `GET /` | User | Dashboard: Authentik app tiles and custom links, grouped by category, with search/filter |
 | `GET /admin` | Admin | Status: OIDC state, override flag, Authentik reachability, version |
 | `GET/POST /admin/branding` | Admin | Title, logo upload, Markdown login message, footer links, theme colour |
 | `GET/POST /admin/auth` | Admin | OIDC + Authentik API config, Test & confirm |
+| `GET/POST /admin/links` | Admin | Custom links (§5.1) |
 | `GET/POST /admin/apps` | Admin | Presentation overrides (v1.1) |
 | `GET/POST /admin/account` | Local admin | Account page, including changing the local admin password |
 | `GET/POST /admin/account/password` | Local admin (also allowed with a `password_change_required` session) | Change password; required after logging in with a generated password |
@@ -213,9 +232,14 @@ local_users   (id, username UNIQUE, password_hash, must_change BOOL,   -- true u
 settings      (key PRIMARY KEY, value_json, updated_at)            -- branding, general prefs
 oidc_configs  (id, state CHECK(state IN ('draft','confirmed','superseded')),
                issuer_url, client_id, client_secret_enc, scopes, claim_map_json,
-               admin_groups_json, discovery_mode, ak_base_url, ak_token_enc,
+               admin_groups_json, ak_base_url, ak_token_enc, ak_app_slug,
                tested_at, tested_by, confirmed_at, confirmed_by, created_at)
 sessions      (id PRIMARY KEY, user_kind, subject, data_enc, created_at, last_seen_at, expires_at)
+custom_links  (id, name, url, description, icon, category, sort_order,
+               new_tab BOOL, enabled BOOL, visibility CHECK(visibility IN ('all','groups')),
+               created_at, updated_at)
+custom_link_groups (link_id REFERENCES custom_links ON DELETE CASCADE, group_name,
+               PRIMARY KEY (link_id, group_name))
 app_overrides (slug PRIMARY KEY, hidden, sort_order, category, icon_url, updated_at)   -- v1.1
 audit_log     (id, at, actor, action, detail_json)                  -- logins, config changes
 ```
@@ -304,7 +328,7 @@ Dockerfile, Makefile, .github/workflows/
 
 **Phase 0: Spike (short)**
 - Stand up Authentik in docker-compose for development. Create an OAuth2/OpenID provider + application and a few test apps with group bindings.
-- Verify app discovery via `for_user` (Mode A) and `goauthentik.io/api` (Mode B), and write down the permissions and claims actually needed.
+- Verify app discovery via `for_user` with a service-account token, including that Hearthport's own slug appears only for users bound to it. Write down the minimum service-account permissions and the claims actually needed.
 
 **Phase 1: Skeleton & bootstrap**
 - Go module, config, SQLite + migrations, structured logging, `/healthz`.
@@ -319,7 +343,9 @@ Dockerfile, Makefile, .github/workflows/
 - Admin role mapping from groups.
 
 **Phase 3: App discovery & dashboard**
-- Authentik API client, Mode A + Mode B, pagination, cache, stale fallback.
+- Authentik API client (service-account token), pagination, cache, stale fallback.
+- Access check at login and on refresh (§4.5).
+- Custom links: admin CRUD, group visibility, merged into dashboard categories (§5.1).
 - Dashboard tiles grouped by category, search, icons, open-in-new-tab.
 
 **Phase 4: Hardening & release**
@@ -328,7 +354,7 @@ Dockerfile, Makefile, .github/workflows/
 - `docs/authentik-setup.md` (step-by-step provider, scope mapping, service account), multi-arch release to GHCR, v1.0.0.
 
 **Later (v1.1+)**
-- App presentation overrides, per-user favourites, back-channel logout, Prometheus `/metrics`, extra non-Authentik links shown to everyone or by group, i18n.
+- App presentation overrides, per-user favourites, back-channel logout, Prometheus `/metrics`, i18n.
 
 ## 13. Acceptance criteria (v1)
 1. A fresh container prints admin credentials. Restarting before a password change prints a **new** password, and the old one no longer works.
@@ -340,9 +366,17 @@ Dockerfile, Makefile, .github/workflows/
 7. With `HEARTHPORT_ENABLE_LOCAL_LOGIN=true`, both options appear and local login works.
 8. Two Authentik users with different group bindings each see only their permitted apps. Removing a binding in Authentik removes the tile within the cache TTL.
 9. If Authentik is unreachable, the dashboard never shows apps the user wasn't previously permitted to see.
+10. A user not bound to the Hearthport application in Authentik can't sign in. If their binding is removed, their session ends within the cache TTL.
+11. A custom link set to "all" is shown to every signed-in user. A link limited to a group is shown only to members of that group. Links with a `javascript:` URL are rejected.
 
-## 14. Open questions
-1. Stack preference: Go + htmx as proposed, or would you prefer something else (e.g. Python/FastAPI or TypeScript/SvelteKit)?
-2. Default discovery mode: service-account token (A) or delegated user token (B)?
-3. Should non-admin OIDC users be allowed in at all by default, or only members of a configured "users" group? (Authentik can also enforce this with a policy on the Hearthport application itself, which is the recommended approach.)
-4. Is there a need for extra links that don't come from Authentik (e.g. external bookmarks)?
+## 14. Decisions
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Stack | Go + htmx (§2) |
+| 2 | App discovery | Service-account token with `for_user` (§5) |
+| 3 | Who can sign in | Any user Authentik permits to access the Hearthport application (§4.5) |
+| 4 | Force bootstrap admin password change | Yes, on first login; password regenerated every boot until changed (§4.1) |
+| 5 | Extra non-Authentik links | Yes, admin-managed custom links with optional group visibility (§5.1) |
+
+No open questions remain. Anything new that comes up in the Phase 0 spike will be added here.
