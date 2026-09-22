@@ -5,6 +5,7 @@
 | # | Requirement | How it is met |
 |---|---|---|
 | G1 | Self-hosted web portal in a single Docker container | One static Go binary with embedded assets; distroless image; state in a `/data` volume |
+| G11 | Optionally use an external PostgreSQL server | Built-in SQLite by default; set `HEARTHPORT_DATABASE_URL` to use PostgreSQL instead (§7.1) |
 | G2 | Login page shows basic public information | Admin-editable title, logo, Markdown message and links, rendered on the unauthenticated login page |
 | G3 | Sign-in via OIDC against Authentik | Authorization Code flow with PKCE, `state` and `nonce` |
 | G4 | Users see only the apps they can access in Authentik | Authentik's API is asked which applications the signed-in user can access (§5) |
@@ -19,6 +20,7 @@
 - Acting as a reverse proxy or forward-auth provider (Authentik's outposts already do this).
 - Identity providers other than Authentik. The OIDC layer stays generic, but app discovery is Authentik-specific.
 - Multiple local users. Only the single bootstrap `admin` account exists locally.
+- Running several Hearthport replicas behind a load balancer. PostgreSQL support makes this possible later, but v1 is tested as a single instance (§7.1).
 
 ## 2. Technology choices
 
@@ -26,8 +28,9 @@
 |---|---|---|
 | Backend | **Go** (stdlib `net/http` + `chi` router) | Single static binary, small image, strong OIDC libraries |
 | OIDC | `github.com/coreos/go-oidc/v3` + `golang.org/x/oauth2` | Well maintained; handles discovery, JWKS and ID-token verification |
-| Storage | **SQLite** (`modernc.org/sqlite`, pure Go, no CGO) | No separate database container; one file on the `/data` volume |
-| Migrations | `pressly/goose` (embedded SQL files) | Versioned schema upgrades on startup |
+| Storage | **SQLite** (`modernc.org/sqlite`, pure Go, no CGO) by default; **PostgreSQL** (`jackc/pgx/v5`) optional | SQLite needs no separate database container. PostgreSQL suits people who already run one, e.g. alongside Authentik (§7.1) |
+| Queries | `sqlc`, generating typed Go code for each database from its own query files | Compile-time checked SQL; each database can use its own syntax where they differ |
+| Migrations | `pressly/goose` (embedded SQL files, one set per database) | Versioned schema upgrades on startup; supports both databases |
 | UI | Server-rendered `html/template` + **htmx** + a small CSS layer (e.g. Pico.css) | No Node build step at runtime and little JavaScript; admin forms are simple |
 | Password hashing | argon2id (`golang.org/x/crypto/argon2`) | Current best practice |
 | Secret encryption at rest | AES-256-GCM | Protects the OIDC client secret and Authentik API token in the DB |
@@ -46,7 +49,8 @@ dashboard needs richer interactivity, without changing the backend.
             │   └─ Admin:  /admin/* (branding, OIDC, app visibility, status)    │
             │                                                                   │
             │  Services: SessionStore · AuthManager · AppCatalog · Settings     │
-            │  SQLite (/data/hearthport.db) · key file (/data/secret.key)       │
+            │  Store: SQLite (/data/hearthport.db) or external PostgreSQL       │
+            │  Key: HEARTHPORT_SECRET_KEY or /data/secret.key                   │
             └───────────────┬──────────────────────────────┬────────────────────┘
                             │ OIDC (discovery, token,      │ REST API
                             │ JWKS, end-session)           │ /api/v3/core/applications/
@@ -56,7 +60,8 @@ dashboard needs richer interactivity, without changing the backend.
 ```
 
 ### Components
-- **SessionStore**: server-side sessions in SQLite. The cookie holds only an opaque random ID (`HttpOnly`, `Secure`, `SameSite=Lax`). Sessions have idle and absolute timeouts.
+- **Store**: one Go interface for all persistence, with a SQLite and a PostgreSQL implementation. The rest of the code doesn't know which database is in use.
+- **SessionStore**: server-side sessions in the database. The cookie holds only an opaque random ID (`HttpOnly`, `Secure`, `SameSite=Lax`). Sessions have idle and absolute timeouts.
 - **AuthManager**: works out which login methods are enabled (§4), runs the local and OIDC login flows, and maps OIDC claims to roles.
 - **AppCatalog**: fetches the user's permitted applications from Authentik, caches them per user, and applies local presentation overrides (§5).
 - **Settings**: typed access to the settings stored in the DB, with encryption for secret fields.
@@ -224,7 +229,7 @@ Admins can add links that aren't Authentik applications, such as docs, a status 
 
 The dashboard is responsive, supports light/dark mode, and works with the keyboard (`/` to focus search).
 
-## 7. Data model (SQLite)
+## 7. Data model
 
 ```sql
 local_users   (id, username UNIQUE, password_hash, must_change BOOL,   -- true until a user sets the password
@@ -242,9 +247,42 @@ custom_link_groups (link_id REFERENCES custom_links ON DELETE CASCADE, group_nam
                PRIMARY KEY (link_id, group_name))
 app_overrides (slug PRIMARY KEY, hidden, sort_order, category, icon_url, updated_at)   -- v1.1
 audit_log     (id, at, actor, action, detail_json)                  -- logins, config changes
+uploads       (id, kind, content_type, bytes BLOB/BYTEA, sha256, created_at)   -- logo, link icons
+meta          (key PRIMARY KEY, value)                              -- schema info, key check value
 ```
 
+Column types differ slightly between the two databases (for example `JSONB`/`TIMESTAMPTZ`/`BYTEA` on PostgreSQL, `TEXT`/`BLOB` on SQLite). Each database has its own migration files; the tables and meaning are the same.
+
+Uploaded files (logo, link icons) are stored in the database rather than on disk. With PostgreSQL, the container then needs no persistent volume, as long as the secret key is provided (§7.1).
+
 "OIDC confirmed" means: a row exists with `state='confirmed'`.
+
+### 7.1 Database choice: SQLite (default) or external PostgreSQL
+
+| | SQLite (default) | PostgreSQL (optional) |
+|---|---|---|
+| Enabled by | Nothing; used when `HEARTHPORT_DATABASE_URL` is unset | `HEARTHPORT_DATABASE_URL=postgres://…` (or `HEARTHPORT_DATABASE_URL_FILE`) |
+| Where data lives | `/data/hearthport.db` on the volume | The external server; `/data` only needed if the secret key is auto-generated there |
+| Supported versions | Bundled | PostgreSQL 14 or newer |
+| Backups | Copy the volume (or `hearthport backup`, which uses SQLite's online backup) | The server's usual tools (`pg_dump`, snapshots) |
+
+**Connecting**
+- A standard connection URL, e.g. `postgres://hearthport:…@db.example.com:5432/hearthport?sslmode=verify-full`. `sslmode`, `sslrootcert` and a `search_path` (to use a schema other than `public`) are set in the URL. `HEARTHPORT_CA_FILE` is also trusted for the database's TLS certificate.
+- Use `HEARTHPORT_DATABASE_URL_FILE` with a Docker secret to keep the password out of the environment. The password is always redacted in logs and on the admin status page.
+- Hearthport needs its own database, or its own schema, and a user who owns it. It can share a PostgreSQL server with Authentik, but must not use Authentik's database.
+- Pool settings: `HEARTHPORT_DB_MAX_CONNS` (default 10). Connections are checked on startup and by `/readyz`.
+
+**Startup**
+- If PostgreSQL isn't reachable yet (for example it's still starting in the same compose stack), Hearthport retries with backoff for up to `HEARTHPORT_DB_STARTUP_TIMEOUT` (default 60s), then exits with a clear error.
+- Migrations and the bootstrap-admin step (§4.1) run inside a PostgreSQL advisory lock. If two containers start at once, only one migrates and generates the admin password.
+
+**Secret key**
+- Encrypted values in the database (OIDC client secret, Authentik token, sessions) can only be read with the same secret key. With PostgreSQL the database may outlive the container, so the key must be kept too: either set `HEARTHPORT_SECRET_KEY` / `_FILE`, or keep `/data` on a persistent volume.
+- On first start Hearthport stores a small encrypted check value in `meta`. On each start it decrypts it. If that fails (wrong or lost key), Hearthport refuses to start and explains why, instead of silently failing to read the OIDC settings.
+
+**Switching an existing install from SQLite to PostgreSQL**
+- `hearthport migrate-db --to "$HEARTHPORT_DATABASE_URL"` copies every table from the current SQLite database into an empty PostgreSQL database, in one transaction, then checks row counts. Run it once with the container stopped, then set `HEARTHPORT_DATABASE_URL` and start as normal. Sessions are not copied, so users sign in again.
+- The same secret key must be used afterwards, because encrypted values are copied as-is.
 
 ## 8. Configuration (environment variables)
 
@@ -252,15 +290,18 @@ audit_log     (id, at, actor, action, detail_json)                  -- logins, c
 |---|---|---|
 | `HEARTHPORT_BASE_URL` | *(required for OIDC)* | Public URL, used to build the redirect URI and secure cookies |
 | `HEARTHPORT_LISTEN_ADDR` | `:8080` | Listen address |
-| `HEARTHPORT_DATA_DIR` | `/data` | SQLite DB, secret key, uploaded logo |
+| `HEARTHPORT_DATA_DIR` | `/data` | SQLite database and auto-generated secret key |
+| `HEARTHPORT_DATABASE_URL` / `_FILE` | — (use SQLite) | PostgreSQL connection URL. When set, PostgreSQL is used instead of SQLite (§7.1) |
+| `HEARTHPORT_DB_MAX_CONNS` | `10` | PostgreSQL connection pool size |
+| `HEARTHPORT_DB_STARTUP_TIMEOUT` | `60s` | How long to wait for PostgreSQL at startup |
 | `HEARTHPORT_ENABLE_LOCAL_LOGIN` | `false` | Break-glass: allow local login after OIDC is confirmed |
 | `HEARTHPORT_RESET_ADMIN_PASSWORD` | `false` | Put the admin password back into the regenerate-on-every-boot state (§4.1) |
-| `HEARTHPORT_SECRET_KEY` / `_FILE` | auto-generated to `/data/secret.key` | Key for at-rest encryption and cookie signing |
+| `HEARTHPORT_SECRET_KEY` / `_FILE` | auto-generated to `/data/secret.key` | Key for at-rest encryption and cookie signing. Recommended with PostgreSQL (§7.1) |
 | `HEARTHPORT_TRUSTED_PROXIES` | — | CIDRs whose `X-Forwarded-*` headers are trusted |
 | `HEARTHPORT_SESSION_TTL` | `12h` | Absolute session lifetime |
 | `HEARTHPORT_APP_CACHE_TTL` | `60s` | Per-user app list cache |
 | `HEARTHPORT_LOG_LEVEL` / `_FORMAT` | `info` / `text` | Logging (`json` available) |
-| `HEARTHPORT_CA_FILE` | — | Extra CA bundle for a privately signed Authentik certificate |
+| `HEARTHPORT_CA_FILE` | — | Extra CA bundle for privately signed Authentik or PostgreSQL certificates |
 
 Environment variables control deployment and the break-glass behaviour.
 Everything about OIDC and branding lives in the web UI, as required.
@@ -275,6 +316,7 @@ Everything about OIDC and branding lives in the web UI, as required.
 - Open-redirect protection: post-login `return_to` must be a relative path.
 - Uploaded logos are type-checked, size-capped, and re-served with a fixed content type.
 - Container runs as a non-root user with a read-only root filesystem; only `/data` is writable.
+- PostgreSQL: TLS recommended (`sslmode=verify-full`); the connection password is read from a file/secret where possible and never logged; Hearthport's database user needs rights only on its own database or schema.
 
 ## 10. Docker packaging
 
@@ -307,6 +349,25 @@ services:
       - ./data:/data
 ```
 
+Example with PostgreSQL:
+```yaml
+services:
+  hearthport:
+    image: ghcr.io/kahooli/hearthport:latest
+    restart: unless-stopped
+    ports: ["8080:8080"]
+    environment:
+      HEARTHPORT_BASE_URL: https://portal.example.com
+      HEARTHPORT_DATABASE_URL_FILE: /run/secrets/hearthport_db_url
+      HEARTHPORT_SECRET_KEY_FILE: /run/secrets/hearthport_secret_key
+    secrets: [hearthport_db_url, hearthport_secret_key]
+secrets:
+  hearthport_db_url:
+    file: ./secrets/db_url            # postgres://hearthport:…@db.example.com:5432/hearthport?sslmode=verify-full
+  hearthport_secret_key:
+    file: ./secrets/secret_key        # e.g. output of: openssl rand -base64 32
+```
+
 Multi-arch images (`linux/amd64`, `linux/arm64`) are published to GHCR by a GitHub Actions workflow on tags.
 
 ## 11. Proposed repository layout
@@ -314,7 +375,9 @@ Multi-arch images (`linux/amd64`, `linux/arm64`) are published to GHCR by a GitH
 ```
 cmd/hearthport/           main.go (serve, reset-admin-password, healthcheck subcommands)
 internal/config/          env parsing
-internal/store/           SQLite, migrations (embedded), repositories
+internal/store/           Store interface + shared contract tests
+internal/store/sqlite/    SQLite implementation, queries, migrations
+internal/store/postgres/  PostgreSQL implementation, queries, migrations
 internal/crypto/          key management, AES-GCM, argon2id
 internal/auth/            local login, OIDC client, login-method policy, sessions, CSRF
 internal/authentik/       API client, app discovery modes A/B, cache
@@ -331,10 +394,11 @@ Dockerfile, Makefile, .github/workflows/
 - Verify app discovery via `for_user` with a service-account token, including that Hearthport's own slug appears only for users bound to it. Write down the minimum service-account permissions and the claims actually needed.
 
 **Phase 1: Skeleton & bootstrap**
-- Go module, config, SQLite + migrations, structured logging, `/healthz`.
+- Go module, config, structured logging, `/healthz` and `/readyz`.
+- Store interface with SQLite and PostgreSQL implementations and migrations; startup retry, advisory lock and secret-key check (§7.1).
 - Bootstrap admin: password regenerated and printed on every boot until changed, forced password change on first login, local login, sessions, CSRF, logout.
 - Base layout/templates, login page with static branding.
-- Dockerfile and compose file; CI (lint with `golangci-lint`, `go test`, image build).
+- Dockerfile and compose files (SQLite and PostgreSQL); CI (lint with `golangci-lint`, `go test`, image build). Store tests run against both SQLite and a PostgreSQL service container.
 
 **Phase 2: Admin & OIDC**
 - Admin area; branding editor (title, logo, Markdown message sanitized with `bluemonday`).
@@ -349,7 +413,7 @@ Dockerfile, Makefile, .github/workflows/
 - Dashboard tiles grouped by category, search, icons, open-in-new-tab.
 
 **Phase 4: Hardening & release**
-- Security headers, rate limiting, audit log view, reset-password CLI.
+- Security headers, rate limiting, audit log view, reset-password CLI, `backup` (SQLite) and `migrate-db` (SQLite → PostgreSQL) CLIs.
 - Tests: unit tests (policy truth table, claim mapping, crypto), integration tests with a mock OIDC provider, and an end-to-end test (Playwright) against a real Authentik container in CI.
 - `docs/authentik-setup.md` (step-by-step provider, scope mapping, service account), multi-arch release to GHCR, v1.0.0.
 
@@ -368,6 +432,9 @@ Dockerfile, Makefile, .github/workflows/
 9. If Authentik is unreachable, the dashboard never shows apps the user wasn't previously permitted to see.
 10. A user not bound to the Hearthport application in Authentik can't sign in. If their binding is removed, their session ends within the cache TTL.
 11. A custom link set to "all" is shown to every signed-in user. A link limited to a group is shown only to members of that group. Links with a `javascript:` URL are rejected.
+12. With `HEARTHPORT_DATABASE_URL` unset, Hearthport uses SQLite. With it set, Hearthport uses PostgreSQL, and every other criterion passes on both.
+13. With PostgreSQL and no `/data` volume, Hearthport keeps its data across container recreation, as long as `HEARTHPORT_SECRET_KEY` is set. Starting with the wrong key fails with a clear error.
+14. `hearthport migrate-db` moves an existing SQLite install to PostgreSQL with no loss of settings, links or the admin password.
 
 ## 14. Decisions
 
@@ -378,5 +445,6 @@ Dockerfile, Makefile, .github/workflows/
 | 3 | Who can sign in | Any user Authentik permits to access the Hearthport application (§4.5) |
 | 4 | Force bootstrap admin password change | Yes, on first login; password regenerated every boot until changed (§4.1) |
 | 5 | Extra non-Authentik links | Yes, admin-managed custom links with optional group visibility (§5.1) |
+| 6 | Database | SQLite by default; external PostgreSQL optional via `HEARTHPORT_DATABASE_URL` (§7.1) |
 
 No open questions remain. Anything new that comes up in the Phase 0 spike will be added here.
