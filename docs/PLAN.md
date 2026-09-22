@@ -8,7 +8,7 @@
 | G2 | Login page shows basic public information | Admin-editable title, logo, Markdown message and links, rendered on the unauthenticated login page |
 | G3 | Sign-in via OIDC against Authentik | Authorization Code flow with PKCE, `state` and `nonce` |
 | G4 | Users see only the apps they can access in Authentik | Authentik's API is asked which applications the signed-in user can access (§5) |
-| G5 | First run: `admin` user with a password printed to stdout | A random password is generated on first boot and printed once in a banner in the container logs (§4.1) |
+| G5 | First run: `admin` user with a password printed to stdout | A random password is printed to the container logs at startup. It is regenerated on every boot until a user logs in and is forced to change it (§4.1) |
 | G6 | OIDC is configured in the web UI by admins | Admin → Authentication settings page, with a "Test & confirm" step (§4.2) |
 | G7 | After OIDC is confirmed, OIDC is the only way to log in | The local login form and endpoint are disabled when a confirmed OIDC config exists… |
 | G8 | …unless an env var re-enables username/password | …or when `HEARTHPORT_ENABLE_LOCAL_LOGIN=true` is set (§4.3) |
@@ -64,21 +64,41 @@ backend.
 
 ### 4.1 Bootstrap admin (first run)
 
-On startup:
-1. If no local `admin` row exists, generate a 24-character random password (crypto/rand, base62), store its argon2id hash, and print a banner to **stdout**:
+The local `admin` row has a `must_change` flag. It is `true` from creation until a person changes the password through the UI, and that is the only thing that clears it.
+
+**On every startup, while the admin password has not been changed by a user:**
+1. Create the `admin` row if it doesn't exist.
+2. Generate a **new** 24-character random password (crypto/rand, base62), replace the stored argon2id hash, and set `must_change = true`. The password printed on the previous boot stops working.
+3. Delete any existing sessions for the local admin, so a session opened with an old generated password can't outlive it.
+4. Print a banner to **stdout**:
    ```
    ================================================================
-    Hearthport initial admin credentials
+    Hearthport admin credentials (temporary; regenerated on every
+    restart until you log in and change the password)
       username: admin
-      password: 7fQk2...  (shown once; change it after first login)
+      password: 7fQk2...
    ================================================================
    ```
-2. The plaintext password is never written to disk. It is printed only when it is generated, so it is not repeated on every restart.
-3. Recovery:
-   - `HEARTHPORT_RESET_ADMIN_PASSWORD=true`: on next boot, generate and print a new password (logs a warning; unset the variable afterwards), or
-   - `docker exec hearthport hearthport reset-admin-password` CLI subcommand.
-4. Optional: `HEARTHPORT_ADMIN_PASSWORD_FILE` (Docker secret) sets the initial password instead of generating one.
-5. After the first login the admin is prompted (optionally forced) to change the password.
+5. The plaintext password is never written to disk or to the audit log; it only appears in the banner.
+
+**Logging in with the generated password:**
+- The login succeeds, but the session is flagged `password_change_required`. Middleware allows only `GET/POST /admin/account/password`, `POST /logout` and static assets. Every other route redirects to the change-password page (APIs and htmx requests get a 403).
+- The change-password form requires the current (generated) password and the new password entered twice. The new password must be at least 12 characters, must differ from the generated one, and passes a zxcvbn-style strength check.
+- On success, in one transaction: store the new hash, set `must_change = false`, write an audit-log entry, rotate the session ID and clear `password_change_required`.
+
+**After the password has been changed by a user:**
+- No password is generated or printed at startup. Instead there is one log line: `local admin password is user-managed; no bootstrap password generated`.
+- Later password changes from `/admin/account` keep `must_change = false`.
+
+**Recovery (forgotten password):**
+- `HEARTHPORT_RESET_ADMIN_PASSWORD=true` sets `must_change = true` on boot (and logs a warning). The regenerate-every-boot cycle above then runs again until a user changes the password. Unset the variable afterwards.
+- `docker exec hearthport hearthport reset-admin-password` does the same without a restart: it sets `must_change = true`, generates a new password and prints it.
+- Both still follow §4.3. If OIDC is confirmed and `HEARTHPORT_ENABLE_LOCAL_LOGIN` is not set, the reset password can't be used to log in, and the banner says so.
+
+**Edge cases:**
+- If OIDC is confirmed and the admin password was never changed (possible only after a reset), the banner is still printed each boot, with a note that local login is disabled unless `HEARTHPORT_ENABLE_LOCAL_LOGIN=true`.
+- Admins can only reach the OIDC settings after changing the password, so OIDC can't be confirmed while the bootstrap password is still in use.
+- There is no env var or secret file to set the admin password up front. The only ways out of the regenerate cycle are a user changing the password in the UI, which keeps the rule simple and auditable.
 
 ### 4.2 OIDC configuration lifecycle
 
@@ -179,7 +199,8 @@ Handling the results:
 | `GET/POST /admin/branding` | Admin | Title, logo upload, Markdown login message, footer links, theme colour |
 | `GET/POST /admin/auth` | Admin | OIDC + Authentik API config, Test & confirm |
 | `GET/POST /admin/apps` | Admin | Presentation overrides (v1.1) |
-| `GET/POST /admin/account` | Local admin | Change local admin password |
+| `GET/POST /admin/account` | Local admin | Account page, including changing the local admin password |
+| `GET/POST /admin/account/password` | Local admin (also allowed with a `password_change_required` session) | Change password; required after logging in with a generated password |
 | `GET /healthz` / `GET /readyz` | Public | Liveness / readiness (DB reachable) |
 
 The dashboard is responsive, supports light/dark mode, and works with the keyboard (`/` to focus search).
@@ -187,7 +208,8 @@ The dashboard is responsive, supports light/dark mode, and works with the keyboa
 ## 7. Data model (SQLite)
 
 ```sql
-local_users   (id, username UNIQUE, password_hash, must_change BOOL, created_at, updated_at)
+local_users   (id, username UNIQUE, password_hash, must_change BOOL,   -- true until a user sets the password
+               password_changed_at, created_at, updated_at)
 settings      (key PRIMARY KEY, value_json, updated_at)            -- branding, general prefs
 oidc_configs  (id, state CHECK(state IN ('draft','confirmed','superseded')),
                issuer_url, client_id, client_secret_enc, scopes, claim_map_json,
@@ -208,8 +230,7 @@ audit_log     (id, at, actor, action, detail_json)                  -- logins, c
 | `HEARTHPORT_LISTEN_ADDR` | `:8080` | Listen address |
 | `HEARTHPORT_DATA_DIR` | `/data` | SQLite DB, secret key, uploaded logo |
 | `HEARTHPORT_ENABLE_LOCAL_LOGIN` | `false` | Break-glass: allow local login after OIDC is confirmed |
-| `HEARTHPORT_RESET_ADMIN_PASSWORD` | `false` | Regenerate and print the admin password on boot |
-| `HEARTHPORT_ADMIN_PASSWORD_FILE` | — | Seed the initial admin password from a file/secret |
+| `HEARTHPORT_RESET_ADMIN_PASSWORD` | `false` | Put the admin password back into the regenerate-on-every-boot state (§4.1) |
 | `HEARTHPORT_SECRET_KEY` / `_FILE` | auto-generated to `/data/secret.key` | Key for at-rest encryption and cookie signing |
 | `HEARTHPORT_TRUSTED_PROXIES` | — | CIDRs whose `X-Forwarded-*` headers are trusted |
 | `HEARTHPORT_SESSION_TTL` | `12h` | Absolute session lifetime |
@@ -287,7 +308,7 @@ Dockerfile, Makefile, .github/workflows/
 
 **Phase 1: Skeleton & bootstrap**
 - Go module, config, SQLite + migrations, structured logging, `/healthz`.
-- Bootstrap admin with password banner, local login, sessions, CSRF, logout.
+- Bootstrap admin: password regenerated and printed on every boot until changed, forced password change on first login, local login, sessions, CSRF, logout.
 - Base layout/templates, login page with static branding.
 - Dockerfile and compose file; CI (lint with `golangci-lint`, `go test`, image build).
 
@@ -310,17 +331,18 @@ Dockerfile, Makefile, .github/workflows/
 - App presentation overrides, per-user favourites, back-channel logout, Prometheus `/metrics`, extra non-Authentik links shown to everyone or by group, i18n.
 
 ## 13. Acceptance criteria (v1)
-1. A fresh container prints admin credentials once. Logging in with them works; restarting does not print them again.
-2. Before OIDC is confirmed, only local login is offered.
-3. An admin can save OIDC settings, test them, and cannot confirm unless the test user is in an admin group.
-4. After confirmation, `/login` shows only the Authentik button and `POST /auth/local` returns 404.
-5. With `HEARTHPORT_ENABLE_LOCAL_LOGIN=true`, both options appear and local login works.
-6. Two Authentik users with different group bindings each see only their permitted apps. Removing a binding in Authentik removes the tile within the cache TTL.
-7. If Authentik is unreachable, the dashboard never shows apps the user wasn't previously permitted to see.
+1. A fresh container prints admin credentials. Restarting before a password change prints a **new** password, and the old one no longer works.
+2. Logging in with the generated password only gives access to the change-password page. After changing it, the admin can use the rest of the UI.
+3. After a user has changed the password, restarts print no password, and the user-chosen password keeps working.
+4. Before OIDC is confirmed, only local login is offered.
+5. An admin can save OIDC settings, test them, and cannot confirm unless the test user is in an admin group.
+6. After confirmation, `/login` shows only the Authentik button and `POST /auth/local` returns 404.
+7. With `HEARTHPORT_ENABLE_LOCAL_LOGIN=true`, both options appear and local login works.
+8. Two Authentik users with different group bindings each see only their permitted apps. Removing a binding in Authentik removes the tile within the cache TTL.
+9. If Authentik is unreachable, the dashboard never shows apps the user wasn't previously permitted to see.
 
 ## 14. Open questions
 1. Stack preference: Go + htmx as proposed, or would you prefer something else (e.g. Python/FastAPI or TypeScript/SvelteKit)?
 2. Default discovery mode: service-account token (A) or delegated user token (B)?
 3. Should non-admin OIDC users be allowed in at all by default, or only members of a configured "users" group? (Authentik can also enforce this with a policy on the Hearthport application itself, which is the recommended approach.)
-4. Force the bootstrap admin to change the password on first login, or keep it optional?
-5. Is there a need for extra links that don't come from Authentik (e.g. external bookmarks)?
+4. Is there a need for extra links that don't come from Authentik (e.g. external bookmarks)?
