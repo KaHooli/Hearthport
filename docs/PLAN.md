@@ -343,6 +343,39 @@ Integrations add live information from the services themselves.
 - Outbound requests have a timeout (`HEARTHPORT_INTEGRATION_TIMEOUT`) and a response size limit, verify TLS (custom CA supported), and don't follow redirects to a different host.
 - The image proxy only fetches from a configured integration's host.
 
+### 5.4 Progressive Web App (post-v1)
+
+In a later release (v1.1), Hearthport will be installable as a PWA, so it can live on a phone's home screen or a desktop dock like a native app.
+
+**What it adds**
+- **Web app manifest** at `/manifest.webmanifest`, generated from the branding settings:
+  - site name and short name, theme and background colours
+  - icons in 192px, 512px and maskable sizes, resized from the uploaded logo
+  - `display: standalone` and `start_url: /`
+  - app shortcuts to the user's first few categories
+- **Service worker** (`/sw.js`), with different caching rules for different content:
+  - Static assets (CSS, JS, icons, fonts) are cached ahead of time and versioned with the release, so the app shell loads instantly.
+  - Pages use network-first, with an offline page ("You're offline; your services need a connection") when the network fails.
+  - **Personal data is not cached** by default: dashboard, category pages, widgets and proxied images. The one exception is an optional "show last dashboard while offline" setting, which is off by default.
+  - Logout sends `Clear-Site-Data: "cache", "storage"`, so nothing personal stays on a shared device.
+- **Install prompt**: an "Install Hearthport" button on the dashboard where the browser supports it, and short instructions for iOS ("Share → Add to Home Screen").
+- **Opening services from the installed app**: service links open in the system browser, or in the service's native app where the admin has set a deep link (e.g. Plex). This way the user isn't stuck inside the Hearthport window.
+
+**Things to test**
+- **Sign-in from an installed app:** Authentik is on a different domain, and on iOS a standalone app can open other domains in a separate in-app browser with its own cookies. That can break the OIDC redirect back to Hearthport.
+  - The login flow must stay a top-level navigation in the same window.
+  - It needs testing on iOS Safari, Android Chrome and desktop Chrome/Edge.
+  - If needed, add an optional longer "remember this device" session for installed apps, to reduce how often users have to sign in.
+- **Updates:** a new release's service worker takes over on the next launch, and shows a small "Updated, reload" notice.
+
+**Maybe later**: web push notifications (e.g. "Your requested show is now available" from Seerr). These would need VAPID keys, per-user push subscriptions in the database, and user opt-in.
+
+**Groundwork in v1** (so the PWA is a small change later):
+- no inline scripts (already required by the CSP)
+- static assets fingerprinted and served with long cache headers
+- a fully responsive layout (§5.2)
+- icons stored in the database at full size, so they can be resized
+
 ## 6. UI / pages
 
 | Route | Access | Purpose |
@@ -607,6 +640,7 @@ Dockerfile, Makefile, .github/workflows/
 - `docs/authentik-setup.md` (step-by-step provider, scope mapping, service account), `docs/integrations.md`, multi-arch release to GHCR, v1.0.0.
 
 **Later (v1.1+)**
+- Progressive Web App: manifest, service worker, offline page, install prompt (§5.4). Later, optional push notifications.
 - More integrations: Audiobookshelf, Kavita, Komga, Tautulli.
 - Back-channel logout, Prometheus `/metrics`, i18n.
 
@@ -647,5 +681,6 @@ Dockerfile, Makefile, .github/workflows/
 | 8 | Apps not placed in a category | Shown under an automatic "Other" category (§5.1) |
 | 9 | Dashboard content | Getting-started guide, announcements, favourites, category overview cards, live widgets (§5.2) |
 | 10 | Live data | In v1: status checks, Seerr, Jellyfin, Plex. Audiobookshelf, Kavita, Komga, Tautulli later (§5.3) |
+| 11 | Installable app | PWA in a later update (v1.1); v1 lays the groundwork (§5.4) |
 
 No open questions remain. Anything new that comes up in the Phase 0 spike will be added here.
