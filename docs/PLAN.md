@@ -5,7 +5,7 @@
 | # | Requirement | How it is met |
 |---|---|---|
 | G1 | Self-hosted web portal in a single Docker container | One static Go binary with embedded assets; distroless image; state in a `/data` volume |
-| G2 | Login page shows basic public information | Admin-editable title, logo, Markdown message and links, rendered on the unauthenticated login page |
+| G2 | Login page shows basic public information | Admin-editable title, logo, Markdown message and links, rendered on the unauthenticated login page. Out of the box it shows the Hearthport mark and the tagline "Your apps, all in one place" (§2.1) |
 | G3 | Sign-in via OIDC against Authentik | Authorization Code flow with PKCE, `state` and `nonce` |
 | G4 | Users see only the services they can access in Authentik | Authentik's API is asked which applications the signed-in user can access (§5); the portal only ever shows those, plus custom links the user is allowed to see |
 | G5 | First run: `admin` user with a password printed to stdout | A random password is printed to the container logs at startup. It is regenerated on every boot until a user logs in and is forced to change it (§4.1) |
@@ -40,6 +40,32 @@
 
 **Decision:** Go + htmx. A SPA (Svelte or React) could be added later if the
 dashboard needs richer interactivity, without changing the backend.
+
+### 2.1 Brand and theme
+
+The artwork in [`assets/`](../assets/README.md) is the **default branding**. Admins can replace the logo, title and tagline in Admin → Branding.
+
+**Colours**
+
+| Name | Hex | Used for |
+|---|---|---|
+| Navy | `#142531` | Dark background, light-mode text, PWA theme colour |
+| Ember | `#EAB377` | Accent, active menu item, primary buttons (on dark) |
+| Ivory | `#FFF6E8` | Dark-mode text, light-mode background |
+| Sea glass | `#8FC8B0` | "Up" status and success |
+
+**Themes**: the colours become CSS custom properties. Dark and light themes follow the system setting, and users can override it.
+- **Dark theme**: navy background, ivory text, ember accents, sea glass for success. Ember and sea glass on navy are both about 8:1 contrast.
+- **Light theme**: ivory or white background, navy text.
+  - Ember (1.75:1 on ivory) and sea glass (1.9:1 on white) are too pale for text on light backgrounds, so they're used only as fills and accents there.
+  - Text and links use a darker ember, chosen during implementation to reach WCAG AA contrast (4.5:1).
+- Status colours are always paired with an icon or label, never colour alone.
+
+**Which mark to use**
+- On dark surfaces: `hearthport-mark.svg`
+- On light surfaces: `hearthport-mark-on-light.svg`
+- Where a solid background is needed: `hearthport-mark-on-dark.svg`
+- In the app, use the PNG wordmark and banner, or versions with the text converted to outlines. The SVGs use live DejaVu Sans text.
 
 ## 3. Architecture
 
@@ -276,6 +302,7 @@ Category: TV
 ```
 
 - A left vertical tab menu: Home, then the user's categories in admin order, then Other, then Admin (admins only). The current page is highlighted.
+- The menu header shows the logo: by default the Hearthport mark, in the variant for the current theme (§2.1).
 - On narrow or mobile screens the menu collapses into a slide-out drawer opened from a menu button.
 - `/` opens a search across every service the user can see, by name and description.
 - Light and dark mode, and full keyboard navigation.
@@ -348,9 +375,10 @@ Integrations add live information from the services themselves.
 In a later release (v1.1), Hearthport will be installable as a PWA, so it can live on a phone's home screen or a desktop dock like a native app.
 
 **What it adds**
-- **Web app manifest** at `/manifest.webmanifest`, generated from the branding settings:
+- **Web app manifest** at `/manifest.webmanifest`, generated from the branding settings. `assets/site.webmanifest` is a reference only.
   - site name and short name, theme and background colours
-  - icons in 192px, 512px and maskable sizes, resized from the uploaded logo
+  - icons: by default the bundled `icon-192.png`, `icon-512.png` and `icon-maskable-192/512.png`, plus `apple-touch-icon.png`; if the admin uploads a logo, icons in these sizes are generated from it instead
+  - theme and background colour `#142531` by default
   - `display: standalone` and `start_url: /`
   - app shortcuts to the user's first few categories
 - **Service worker** (`/sw.js`), with different caching rules for different content:
@@ -374,6 +402,7 @@ In a later release (v1.1), Hearthport will be installable as a PWA, so it can li
 - no inline scripts (already required by the CSP)
 - static assets fingerprinted and served with long cache headers
 - a fully responsive layout (§5.2)
+- default favicon (`favicon.svg`, `favicon.ico` with 16/32/48 px) and Apple touch icon already linked from every page
 - icons stored in the database at full size, so they can be resized
 
 ## 6. UI / pages
@@ -594,6 +623,8 @@ internal/dashboard/       guide, announcements, favourites
 internal/integrations/    Integration interface, registry, cache, image proxy
   status/ seerr/ jellyfin/ plex/   one package per integration type
 internal/web/             router, handlers, middleware, templates/, static/
+assets/                   brand artwork source (SVG + generated PNG/ICO); copied into
+                          internal/web/static/brand/ at build time and embedded with go:embed
 docs/                     PLAN.md, authentik-setup.md
 deploy/                   docker-compose.yml examples
 Dockerfile, Makefile, .github/workflows/
