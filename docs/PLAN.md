@@ -5,18 +5,24 @@
 | # | Requirement | How it is met |
 |---|---|---|
 | G1 | Self-hosted web portal in a single Docker container | One static Go binary with embedded assets; distroless image; state in a `/data` volume |
-| G2 | Login page shows basic public information | Admin-editable title, logo, Markdown message and links, rendered on the unauthenticated login page |
+| G2 | Login page shows basic public information | Admin-editable title, logo, Markdown message and links, rendered on the unauthenticated login page. Out of the box it shows the Hearthport mark and the tagline "Your apps, all in one place" (§2.1) |
 | G3 | Sign-in via OIDC against Authentik | Authorization Code flow with PKCE, `state` and `nonce` |
-| G4 | Users see only the apps they can access in Authentik | Authentik's API is asked which applications the signed-in user can access (§5) |
-| G5 | First run: `admin` user with a password printed to stdout | A random password is generated on first boot and printed once in a banner in the container logs (§4.1) |
+| G4 | Users see only the services they can access in Authentik | Authentik's API is asked which applications the signed-in user can access (§5); the portal only ever shows those, plus custom links the user is allowed to see |
+| G5 | First run: `admin` user with a password printed to stdout | A random password is printed to the container logs at startup. It is regenerated on every boot until a user logs in and is forced to change it (§4.1) |
 | G6 | OIDC is configured in the web UI by admins | Admin → Authentication settings page, with a "Test & confirm" step (§4.2) |
 | G7 | After OIDC is confirmed, OIDC is the only way to log in | The local login form and endpoint are disabled when a confirmed OIDC config exists… |
 | G8 | …unless an env var re-enables username/password | …or when `HEARTHPORT_ENABLE_LOCAL_LOGIN=true` is set (§4.3) |
+| G9 | Only users Authentik allows to use Hearthport can sign in | Authentik's policy bindings on the Hearthport application, re-checked by Hearthport at login and on every app-list refresh (§4.5) |
+| G10 | Admins can share extra links in the portal | Services can also be custom links, shown to all signed-in users or only to chosen Authentik groups (§5.1) |
+| G11 | Optionally use an external PostgreSQL server | Built-in SQLite by default; set `HEARTHPORT_DATABASE_URL` to use PostgreSQL instead (§7.1) |
+| G12 | An easy overview of each user's services and how to use them | A dashboard home page and a left-hand category menu (TV, Movies, Books, Comics, …). Each category page shows how to **request** (e.g. Seerr) and how to **consume** (e.g. Plex), with instructions and app download links (§5.1, §5.2) |
+| G13 | Live information from the services themselves | Integrations: status checks for every service, plus Seerr requests and Jellyfin/Plex recently added (§5.3) |
 
 ### Non-goals (v1)
 - Acting as a reverse proxy or forward-auth provider (Authentik's outposts already do this).
 - Identity providers other than Authentik. The OIDC layer stays generic, but app discovery is Authentik-specific.
 - Multiple local users. Only the single bootstrap `admin` account exists locally.
+- Running several Hearthport replicas behind a load balancer. PostgreSQL support makes this possible later, but v1 is tested as a single instance (§7.1).
 
 ## 2. Technology choices
 
@@ -24,16 +30,42 @@
 |---|---|---|
 | Backend | **Go** (stdlib `net/http` + `chi` router) | Single static binary, small image, strong OIDC libraries |
 | OIDC | `github.com/coreos/go-oidc/v3` + `golang.org/x/oauth2` | Well maintained; handles discovery, JWKS and ID-token verification |
-| Storage | **SQLite** (`modernc.org/sqlite`, pure Go, no CGO) | No separate database container; one file on the `/data` volume |
-| Migrations | `pressly/goose` (embedded SQL files) | Versioned schema upgrades on startup |
+| Storage | **SQLite** (`modernc.org/sqlite`, pure Go, no CGO) by default; **PostgreSQL** (`jackc/pgx/v5`) optional | SQLite needs no separate database container. PostgreSQL suits people who already run one, e.g. alongside Authentik (§7.1) |
+| Queries | `sqlc`, generating typed Go code for each database from its own query files | Compile-time checked SQL; each database can use its own syntax where they differ |
+| Migrations | `pressly/goose` (embedded SQL files, one set per database) | Versioned schema upgrades on startup; supports both databases |
 | UI | Server-rendered `html/template` + **htmx** + a small CSS layer (e.g. Pico.css) | No Node build step at runtime and little JavaScript; admin forms are simple |
 | Password hashing | argon2id (`golang.org/x/crypto/argon2`) | Current best practice |
 | Secret encryption at rest | AES-256-GCM | Protects the OIDC client secret and Authentik API token in the DB |
 | Container | Multi-stage build → `gcr.io/distroless/static:nonroot` | Small image with little attack surface; runs as a non-root user |
 
-A SPA (Svelte or React) is an alternative if the dashboard later needs rich
-interactivity. The API is designed so one could be added without changing the
-backend.
+**Decision:** Go + htmx. A SPA (Svelte or React) could be added later if the
+dashboard needs richer interactivity, without changing the backend.
+
+### 2.1 Brand and theme
+
+The artwork in [`assets/`](../assets/README.md) is the **default branding**. Admins can replace the logo, title and tagline in Admin → Branding.
+
+**Colours**
+
+| Name | Hex | Used for |
+|---|---|---|
+| Navy | `#142531` | Dark background, light-mode text, PWA theme colour |
+| Ember | `#EAB377` | Accent, active menu item, primary buttons (on dark) |
+| Ivory | `#FFF6E8` | Dark-mode text, light-mode background |
+| Sea glass | `#8FC8B0` | "Up" status and success |
+
+**Themes**: the colours become CSS custom properties. Dark and light themes follow the system setting, and users can override it.
+- **Dark theme**: navy background, ivory text, ember accents, sea glass for success. Ember and sea glass on navy are both about 8:1 contrast.
+- **Light theme**: ivory or white background, navy text.
+  - Ember (1.75:1 on ivory) and sea glass (1.9:1 on white) are too pale for text on light backgrounds, so they're used only as fills and accents there.
+  - Text and links use a darker ember, chosen during implementation to reach WCAG AA contrast (4.5:1).
+- Status colours are always paired with an icon or label, never colour alone.
+
+**Which mark to use**
+- On dark surfaces: `hearthport-mark.svg`
+- On light surfaces: `hearthport-mark-on-light.svg`
+- Where a solid background is needed: `hearthport-mark-on-dark.svg`
+- In the app, use the PNG wordmark and banner, or versions with the text converted to outlines. The SVGs use live DejaVu Sans text.
 
 ## 3. Architecture
 
@@ -41,44 +73,71 @@ backend.
             ┌──────────────────────── Docker container ────────────────────────┐
  Browser ──▶│  HTTP server (:8080)                                              │
             │   ├─ Public: /login, /auth/*, /static/*, /healthz                 │
-            │   ├─ User:   / (dashboard), /logout                               │
-            │   └─ Admin:  /admin/* (branding, OIDC, app visibility, status)    │
+            │   ├─ User:   / (dashboard), /c/{category}, /search, /widgets/*,   │
+            │   │          /img/*, /logout                                      │
+            │   └─ Admin:  /admin/* (branding, OIDC, catalog, dashboard,        │
+            │              integrations, status)                                │
             │                                                                   │
-            │  Services: SessionStore · AuthManager · AppCatalog · Settings     │
-            │  SQLite (/data/hearthport.db) · key file (/data/secret.key)       │
-            └───────────────┬──────────────────────────────┬────────────────────┘
-                            │ OIDC (discovery, token,      │ REST API
-                            │ JWKS, end-session)           │ /api/v3/core/applications/
-                            ▼                              ▼
-                     ┌──────────────────── Authentik ───────────────────┐
-                     └──────────────────────────────────────────────────┘
+            │  Services: SessionStore · AuthManager · AppDiscovery · Catalog ·  │
+            │            Integrations · Settings                                │
+            │  Store: SQLite (/data/hearthport.db) or external PostgreSQL       │
+            │  Key: HEARTHPORT_SECRET_KEY or /data/secret.key                   │
+            └──────┬─────────────────────────────┬─────────────────┬────────────┘
+                   │ OIDC (discovery, token,     │ REST API        │ Integrations (server-side only)
+                   │ JWKS, end-session)          │ applications    │ status checks, Seerr, Jellyfin, Plex
+                   ▼                             ▼                 ▼
+            ┌──────────────────── Authentik ─────────────┐   ┌──── Your services ────┐
+            └────────────────────────────────────────────┘   └───────────────────────┘
 ```
 
 ### Components
-- **SessionStore**: server-side sessions in SQLite. The cookie holds only an opaque random ID (`HttpOnly`, `Secure`, `SameSite=Lax`). Sessions have idle and absolute timeouts.
+- **Store**: one Go interface for all persistence, with a SQLite and a PostgreSQL implementation. The rest of the code doesn't know which database is in use.
+- **SessionStore**: server-side sessions in the database. The cookie holds only an opaque random ID (`HttpOnly`, `Secure`, `SameSite=Lax`). Sessions have idle and absolute timeouts.
 - **AuthManager**: works out which login methods are enabled (§4), runs the local and OIDC login flows, and maps OIDC claims to roles.
-- **AppCatalog**: fetches the user's permitted applications from Authentik, caches them per user, and applies local presentation overrides (§5).
+- **AppDiscovery**: fetches the user's permitted applications from Authentik and caches them per user (§5).
+- **Catalog**: combines those apps with the admin-defined services, categories and sections to build each user's menu, category pages and dashboard (§5.1, §5.2).
+- **Integrations**: status checks and service API clients, run on the server with cached results (§5.3).
 - **Settings**: typed access to the settings stored in the DB, with encryption for secret fields.
 
 ## 4. Authentication model
 
 ### 4.1 Bootstrap admin (first run)
 
-On startup:
-1. If no local `admin` row exists, generate a 24-character random password (crypto/rand, base62), store its argon2id hash, and print a banner to **stdout**:
+The local `admin` row has a `must_change` flag. It is `true` from creation until a person changes the password through the UI, and that is the only thing that clears it.
+
+**On every startup, while the admin password has not been changed by a user:**
+1. Create the `admin` row if it doesn't exist.
+2. Generate a **new** 24-character random password (crypto/rand, base62), replace the stored argon2id hash, and set `must_change = true`. The password printed on the previous boot stops working.
+3. Delete any existing sessions for the local admin, so a session opened with an old generated password can't outlive it.
+4. Print a banner to **stdout**:
    ```
    ================================================================
-    Hearthport initial admin credentials
+    Hearthport admin credentials (temporary; regenerated on every
+    restart until you log in and change the password)
       username: admin
-      password: 7fQk2...  (shown once; change it after first login)
+      password: 7fQk2...
    ================================================================
    ```
-2. The plaintext password is never written to disk. It is printed only when it is generated, so it is not repeated on every restart.
-3. Recovery:
-   - `HEARTHPORT_RESET_ADMIN_PASSWORD=true`: on next boot, generate and print a new password (logs a warning; unset the variable afterwards), or
-   - `docker exec hearthport hearthport reset-admin-password` CLI subcommand.
-4. Optional: `HEARTHPORT_ADMIN_PASSWORD_FILE` (Docker secret) sets the initial password instead of generating one.
-5. After the first login the admin is prompted (optionally forced) to change the password.
+5. The plaintext password is never written to disk or to the audit log; it only appears in the banner.
+
+**Logging in with the generated password:**
+- The login succeeds, but the session is flagged `password_change_required`. Middleware allows only `GET/POST /admin/account/password`, `POST /logout` and static assets. Every other route redirects to the change-password page (APIs and htmx requests get a 403).
+- The change-password form requires the current (generated) password and the new password entered twice. The new password must be at least 12 characters, must differ from the generated one, and passes a zxcvbn-style strength check.
+- On success, in one transaction: store the new hash, set `must_change = false`, write an audit-log entry, rotate the session ID and clear `password_change_required`.
+
+**After the password has been changed by a user:**
+- No password is generated or printed at startup. Instead there is one log line: `local admin password is user-managed; no bootstrap password generated`.
+- Later password changes from `/admin/account` keep `must_change = false`.
+
+**Recovery (forgotten password):**
+- `HEARTHPORT_RESET_ADMIN_PASSWORD=true` sets `must_change = true` on boot (and logs a warning). The regenerate-every-boot cycle above then runs again until a user changes the password. Unset the variable afterwards.
+- `docker exec hearthport hearthport reset-admin-password` does the same without a restart: it sets `must_change = true`, generates a new password and prints it.
+- Both still follow §4.3. If OIDC is confirmed and `HEARTHPORT_ENABLE_LOCAL_LOGIN` is not set, the reset password can't be used to log in, and the banner says so.
+
+**Edge cases:**
+- If OIDC is confirmed and the admin password was never changed (possible only after a reset), the banner is still printed each boot, with a note that local login is disabled unless `HEARTHPORT_ENABLE_LOCAL_LOGIN=true`.
+- Admins can only reach the OIDC settings after changing the password, so OIDC can't be confirmed while the bootstrap password is still in use.
+- There is no env var or secret file to set the admin password up front. The only ways out of the regenerate cycle are a user changing the password in the UI, which keeps the rule simple and auditable.
 
 ### 4.2 OIDC configuration lifecycle
 
@@ -96,13 +155,14 @@ Admin → Authentication page fields:
 - Scopes (default `openid profile email groups`; see §5)
 - Claim mappings: username (`preferred_username`), display name (`name`), email, groups (`groups`)
 - **Admin group(s)**: Authentik group names whose members become Hearthport admins (e.g. `hearthport-admins`)
-- Authentik API settings for app discovery (§5): base URL, API token (encrypted)
+- Authentik API settings for app discovery (§5): base URL, service-account API token (encrypted)
+- Hearthport's application slug in Authentik (default `hearthport`), used for the access check in §4.5
 - Read-only: the redirect URI to paste into Authentik (`{BASE_URL}/auth/oidc/callback`)
 
 **Test & confirm flow** (stops admins locking themselves out):
 1. The admin clicks *Test & confirm*. Hearthport runs discovery and shows any errors inline.
 2. The browser is sent through a real OIDC login using the draft settings.
-3. On callback Hearthport verifies the ID token, extracts the claims, and checks that the authenticated user **matches an admin group**. It also checks that the Authentik API credentials can list applications.
+3. On callback Hearthport verifies the ID token, extracts the claims, and checks that the authenticated user **matches an admin group**. It also checks that the Authentik API service-account token can list applications for that user, and that the Hearthport application itself is in that list (§4.5).
 4. The results page shows the received claims, the role that would be assigned, and the number of apps discovered.
 5. Only if every check passes can the admin click **Confirm**. The state becomes `confirmed` and local login is switched off from then on (existing sessions stay valid until they expire).
 6. Editing a confirmed config saves it as a new draft. The confirmed config stays active until the new draft is itself tested and confirmed.
@@ -130,9 +190,18 @@ Login-method truth table:
 - Authorization Code + **PKCE (S256)**, random `state` and `nonce` stored in a short-lived signed pre-auth cookie.
 - ID token is verified (issuer, audience, expiry, nonce, signature via JWKS).
 - Roles: `admin` if any configured admin group is in the `groups` claim, otherwise `user`. Roles are re-evaluated on every login and never stored permanently.
-- Session stores: subject, username, display name, email, groups, role, and the access/refresh tokens (encrypted) if the delegated discovery mode is used.
+- Session stores: subject, username, display name, email, groups, role, and the Authentik user `pk`. User access/refresh tokens are not kept after login.
 - **Logout**: destroys the local session, then redirects to Authentik's `end_session_endpoint` with `id_token_hint` and `post_logout_redirect_uri`.
 - Optional (v1.1): back-channel logout endpoint.
+
+### 4.5 Who can sign in
+
+Any Authentik user whose access to the Hearthport application is allowed in Authentik can sign in. Hearthport has no user list of its own.
+
+- **Main gate, in Authentik:** the admin binds users, groups or policies to the Hearthport application in Authentik. Authentik refuses the authorization request for anyone else, so they never reach Hearthport's callback.
+- **Second check, in Hearthport:** at the OIDC callback, Hearthport fetches the user's permitted applications (§5). If the Hearthport application slug is not in the list, it shows a "you don't have access" page and creates no session. This catches mistakes such as the Hearthport application having no bindings at all, which Authentik treats as "allow everyone".
+- **Revocation:** on each app-list refresh (cache TTL, §5), if Hearthport's own slug has disappeared from the user's list, the session is ended and the user is sent to `/login`.
+- `admin` vs `user` role is decided separately by the admin group(s) (§4.4). Access to Hearthport doesn't depend on group names configured in Hearthport.
 
 ## 5. App discovery: "only show apps the user can access"
 
@@ -141,29 +210,200 @@ application's policy/group/user bindings. Its own *My applications* page uses
 `GET /api/v3/core/applications/`, which returns only the apps the requesting
 user can access. Hearthport reuses that decision instead of copying policies.
 
-Two supported modes, chosen in the admin UI:
-
-**Mode A: Service-account token (default, recommended)**
-- Admin creates an Authentik service account + API token with permission to view applications and users.
+**Decision: service-account token.**
+- The admin creates an Authentik service account and an API token for it, with permission to view applications and users (minimum permissions to be confirmed in the Phase 0 spike).
 - Hearthport calls `GET /api/v3/core/applications/?for_user=<pk>&page_size=100` (following pagination), where `<pk>` is the Authentik user ID.
-- The user's `pk` is found by `GET /api/v3/core/users/?username=<preferred_username>` (cached), or read directly from a custom `ak_user_pk` claim added via an Authentik scope mapping.
-- Pros: user tokens never gain API access; works the same for all users.
-
-**Mode B: Delegated user token**
-- Add Authentik's `goauthentik.io/api` scope to the Hearthport provider and request it at login. The user's access token is then used to call `GET /api/v3/core/applications/` directly.
-- Pros: no service account; results are exactly what the user sees in Authentik.
-- Cons: the portal holds a token with API access as that user (significant for Authentik admins), so tokens must be refreshed and stored encrypted.
+- The user's `pk` is found by `GET /api/v3/core/users/?username=<preferred_username>` at login and stored in the session. If a custom `ak_user_pk` claim is added via an Authentik scope mapping, it is used instead.
+- User tokens never get API access, and the behaviour is the same for every user.
+- Not planned for v1: using the user's own token (via Authentik's `goauthentik.io/api` scope). It would give the portal API access as each user, which is too powerful for Authentik admins.
 
 > **Spike (Phase 0):** confirm, against the target Authentik version, that `for_user` gives the same results as the user's own library view (including `superuser_full_list` behaviour for Authentik superusers), and the minimum permissions the service account needs.
 
 Handling the results:
 - Fields used: `name`, `slug`, `group`, `meta_launch_url` (falls back to the provider's launch URL), `meta_icon`, `meta_description`, `meta_publisher`, `open_in_new_tab`.
-- Apps with no launch URL are skipped. The Hearthport app itself is hidden.
+- Apps with no launch URL are skipped. The Hearthport app itself is hidden, but its presence is used for the access check (§4.5).
 - Icons: relative `meta_icon` paths are resolved against the Authentik base URL. Optionally Hearthport proxies and caches icons so the browser never calls Authentik's API directly.
 - **Cache**: per-user, in memory, TTL 60s (configurable), cleared on login. A "refresh" button bypasses it.
 - **Failure mode**: if Authentik is unreachable, show the last cached list with a stale badge. If there is no cache, show an error. Never fall back to showing all apps.
 
-**Local presentation overrides** (admin UI, v1.1): per-app slug overrides for display order, category, icon, hidden flag, and pinned/favourite. These can only **hide or restyle** apps. They can never grant access to an app Authentik did not return.
+### 5.1 Catalog: services, categories and sections
+
+Authentik decides *which* apps a user can access. The catalog decides *how they are presented*: which category they belong to, what each one is for, and how to use it. Admins manage everything below at `/admin/catalog`. The catalog can only arrange and describe services; it can never grant access to an Authentik app the user wasn't given.
+
+```
+Category: Books                     (left menu item)
+ ├─ Section: Request        [request]   → Seerr        "Search for the book and click Request"
+ ├─ Section: Read eBooks    [consume]   → Kavita, Calibre-Web
+ └─ Section: Listen         [consume]   → Audiobookshelf
+Category: TV
+ ├─ Section: Request        [request]   → Seerr        "Search for the show, then Request"
+ └─ Section: Watch          [consume]   → Plex, Jellyfin
+```
+
+**Service**: one entry per thing a user can use (Plex, Seerr, Kavita, a wiki, …).
+- **Source**: either an **Authentik app** (by slug; visible only if Authentik returns it for the user, §5) or a **custom link** (not in Authentik; visible to all signed-in users or only to selected Authentik groups, matched against the `groups` claim).
+- **Fields**: name, icon (upload, image URL or built-in icon name), short description, launch URL (defaults to Authentik's launch URL), open-in-new-tab.
+- **How to access**:
+  - Markdown instructions, e.g. "Accept the Plex invite email first, then sign in with your Plex account".
+  - A list of app links, each with a platform (iOS, Android, Apple TV, Android TV, Roku, Windows, macOS, Linux, Web, Other) and a store or download URL.
+- **Integration** (optional, §5.3).
+
+**Category**: name, slug, icon, sort order, optional Markdown intro. A category is shown in the left menu only if the user can access at least one service placed in it.
+
+**Section**: belongs to one category.
+- Has a title (e.g. "Request", "Watch", "Read eBooks", "Listen to Audiobooks") and a sort order.
+- Has a type: `request`, `consume` or `other`. The type sets the section's icon and default order (request first); the title is free text.
+- A section with no services the user can access is hidden.
+
+**Placement**: puts a service into a section, with an optional category-specific note and a sort order.
+- **One service can be placed in many sections and categories**, e.g. Plex under TV › Watch and Movies › Watch, or Seerr under the Request section of TV, Movies and Books.
+
+**"Other" category**: automatic and not editable. It holds every Authentik app the user can access that isn't placed anywhere, so nothing the user can use is ever invisible. It's hidden when empty. The admin catalog page lists unplaced Authentik apps so they are easy to sort.
+
+**Starter template**: on an empty catalog, the admin can apply a "Media server" preset. It creates these categories, which the admin can then rename, delete or attach services to:
+
+| Category | Sections |
+|---|---|
+| TV | Request, Watch |
+| Movies | Request, Watch |
+| Music | Request, Listen |
+| Books | Request, Read eBooks, Listen to Audiobooks |
+| Comics | Request, Read |
+
+**Validation**:
+- Only `http://` and `https://` URLs are accepted for launch, app and custom links (no `javascript:` or `data:`).
+- Names are escaped as plain text. Markdown is rendered and then sanitised (§9).
+- Icon uploads follow the logo upload rules.
+
+**Failure behaviour**: if Authentik is unreachable and there's no cached app list, the portal shows an error instead of the menu, because the §4.5 access check can't run. Custom links are not shown on their own in that case.
+
+**Admin UI** (`/admin/catalog`):
+- Tabs for Services, Categories (with their sections) and Unplaced apps.
+- Drag or up/down reordering.
+- A "preview as user/group" view that shows the menu and pages a given group would see.
+
+### 5.2 Portal layout and dashboard
+
+**Layout** (every signed-in page):
+
+```
+┌───────────────┬──────────────────────────────────────────────────────┐
+│ [logo] Hearth │  Search (/)                        Favs   user v     │
+├───────────────┼──────────────────────────────────────────────────────┤
+│ > Home        │                                                      │
+│   TV          │   page content                                       │
+│   Movies      │                                                      │
+│   Books       │                                                      │
+│   Comics      │                                                      │
+│   Other       │                                                      │
+│───────────────│                                                      │
+│   Admin       │                                                      │
+└───────────────┴──────────────────────────────────────────────────────┘
+```
+
+- A left vertical tab menu: Home, then the user's categories in admin order, then Other, then Admin (admins only). The current page is highlighted.
+- The menu header shows the logo: by default the Hearthport mark, in the variant for the current theme (§2.1).
+- On narrow or mobile screens the menu collapses into a slide-out drawer opened from a menu button.
+- `/` opens a search across every service the user can see, by name and description.
+- Light and dark mode, and full keyboard navigation.
+
+**Category page** (`/c/{slug}`):
+- The category intro, then each section in order, with the section type's icon and title.
+- Each service appears as a card with:
+  - icon, name, short description and the category-specific note
+  - an **Open** button (launch URL) and a status dot (§5.3)
+  - **Get the app** buttons, one per platform link
+  - an expandable **How to use** panel with the Markdown instructions
+  - a ☆ button to add or remove it from favourites
+  - integration widgets where configured, e.g. "Recently added to TV" from Plex or Jellyfin
+
+**Dashboard** (`/`, the home page after login), top to bottom:
+1. **Getting started guide**: admin-written Markdown for new users, e.g. accepting invites and installing apps. Each user can dismiss it. When the admin publishes a new version, it's shown again to everyone.
+2. **Announcements**: admin-written Markdown posts, newest first.
+   - Each has an optional start and end date, so posts appear and expire automatically.
+   - Each can be targeted at all users or only at selected Authentik groups.
+3. **Favourites**: the services this user has starred, as compact one-click launch tiles. If empty, it explains how to star a service.
+4. **Your services**: one overview card per category the user can access. Each card shows the category's sections with their services' icons, a quick **Request** button (the first request service) and an **Open** button (the first consume service), and links to the category page.
+5. **Live widgets** (§5.3): "Your requests" (Seerr), "Recently added" (Jellyfin/Plex), and a service status summary.
+
+**Per-user data**: favourites and the dismissed guide version are stored against the user's Authentik `sub` in a small `users` table. This is created on first login and holds no passwords.
+
+### 5.3 Integrations (v1)
+
+Integrations add live information from the services themselves.
+
+**Framework**
+- A Go `Integration` interface, with one package per integration type:
+  - `Type()`
+  - `Validate(config)`
+  - `Test(ctx)`
+  - `Status(ctx)`
+  - optional `Widgets(ctx, user)`
+- Configured per service at `/admin/integrations`: type, base URL, API key or token (encrypted at rest, write-only in the UI) and type-specific settings. A **Test connection** button checks the settings.
+- **Every call is made by the Hearthport server.** API keys and tokens never reach the browser. Images such as posters and covers are fetched through `/img/*`, which is proxied, size-limited and cached.
+- Widgets are htmx fragments (`/widgets/*`) loaded after the page renders, so a slow or unavailable service never blocks the dashboard or a category page. They show "unavailable" when the service can't be reached.
+- Results are cached on the server: status for 60s, lists for 5 minutes (both configurable). Lists are cached per user when they depend on the user.
+
+**Status checks (any service)**
+- A background checker requests each service's URL (or a configured health path) every `HEARTHPORT_STATUS_INTERVAL`, and compares the HTTP status against the accepted codes (default 200–399).
+- Shown as a green/amber/red dot on service cards, plus a status summary widget on the dashboard.
+- Users only see status for services they can access.
+
+**Seerr (Overseerr / Jellyseerr / Seerr)**
+- The user is matched to a Seerr user by email (default) or username. The match is cached.
+- **"Your requests" widget**: the user's recent requests with their title, poster and status (pending, approved, available, declined), each linking to the item in Seerr.
+- Only the matched user's own requests are shown. If there's no match, the widget explains that the user needs to sign in to Seerr first.
+
+**Jellyfin**
+- The user is matched to a Jellyfin user by username (default) or email.
+- **"Recently added" widget**: calls `/Users/{id}/Items/Latest` as that Jellyfin user, so results respect the user's library access in Jellyfin.
+- The admin maps Jellyfin libraries to Hearthport categories, so TV pages show TV additions and so on.
+
+**Plex**
+- **"Recently added" widget** per library section, using the Plex server token. The admin maps Plex library sections to Hearthport categories.
+- Limitation: Plex's server API doesn't cheaply tell us which libraries are shared with each user. Each mapped section therefore has its own visibility setting: all users, or selected Authentik groups. The admin must set this to match their Plex sharing.
+
+**Later (v1.x)**: Audiobookshelf, Kavita, Komga and Tautulli, built on the same interface.
+
+**Safety**
+- Only admins can set integration URLs.
+- Outbound requests have a timeout (`HEARTHPORT_INTEGRATION_TIMEOUT`) and a response size limit, verify TLS (custom CA supported), and don't follow redirects to a different host.
+- The image proxy only fetches from a configured integration's host.
+
+### 5.4 Progressive Web App (post-v1)
+
+In a later release (v1.1), Hearthport will be installable as a PWA, so it can live on a phone's home screen or a desktop dock like a native app.
+
+**What it adds**
+- **Web app manifest** at `/manifest.webmanifest`, generated from the branding settings. `assets/site.webmanifest` is a reference only.
+  - site name and short name, theme and background colours
+  - icons: by default the bundled `icon-192.png`, `icon-512.png` and `icon-maskable-192/512.png`, plus `apple-touch-icon.png`; if the admin uploads a logo, icons in these sizes are generated from it instead
+  - theme and background colour `#142531` by default
+  - `display: standalone` and `start_url: /`
+  - app shortcuts to the user's first few categories
+- **Service worker** (`/sw.js`), with different caching rules for different content:
+  - Static assets (CSS, JS, icons, fonts) are cached ahead of time and versioned with the release, so the app shell loads instantly.
+  - Pages use network-first, with an offline page ("You're offline; your services need a connection") when the network fails.
+  - **Personal data is not cached** by default: dashboard, category pages, widgets and proxied images. The one exception is an optional "show last dashboard while offline" setting, which is off by default.
+  - Logout sends `Clear-Site-Data: "cache", "storage"`, so nothing personal stays on a shared device.
+- **Install prompt**: an "Install Hearthport" button on the dashboard where the browser supports it, and short instructions for iOS ("Share → Add to Home Screen").
+- **Opening services from the installed app**: service links open in the system browser, or in the service's native app where the admin has set a deep link (e.g. Plex). This way the user isn't stuck inside the Hearthport window.
+
+**Things to test**
+- **Sign-in from an installed app:** Authentik is on a different domain, and on iOS a standalone app can open other domains in a separate in-app browser with its own cookies. That can break the OIDC redirect back to Hearthport.
+  - The login flow must stay a top-level navigation in the same window.
+  - It needs testing on iOS Safari, Android Chrome and desktop Chrome/Edge.
+  - If needed, add an optional longer "remember this device" session for installed apps, to reduce how often users have to sign in.
+- **Updates:** a new release's service worker takes over on the next launch, and shows a small "Updated, reload" notice.
+
+**Maybe later**: web push notifications (e.g. "Your requested show is now available" from Seerr). These would need VAPID keys, per-user push subscriptions in the database, and user opt-in.
+
+**Groundwork in v1** (so the PWA is a small change later):
+- no inline scripts (already required by the CSP)
+- static assets fingerprinted and served with long cache headers
+- a fully responsive layout (§5.2)
+- default favicon (`favicon.svg`, `favicon.ico` with 16/32/48 px) and Apple touch icon already linked from every page
+- icons stored in the database at full size, so they can be resized
 
 ## 6. UI / pages
 
@@ -174,31 +414,103 @@ Handling the results:
 | `GET /auth/oidc/start` | Public | Begin OIDC flow |
 | `GET /auth/oidc/callback` | Public | Complete OIDC flow (normal login or admin test) |
 | `POST /logout` | Session | Logout (+ RP-initiated logout at Authentik) |
-| `GET /` | User | Dashboard: app tiles grouped by Authentik `group`, search/filter |
+| `GET /` | User | Dashboard: getting-started guide, announcements, favourites, category overview, live widgets (§5.2) |
+| `GET /c/{slug}` | User | Category page: sections with service cards, instructions and app links (§5.2) |
+| `GET /c/other` | User | Automatic "Other" category (Authentik apps not placed anywhere) |
+| `GET /search` | User | Search across the user's services |
+| `POST /favourites/{service}` | User | Add or remove a favourite |
+| `POST /guide/dismiss` | User | Dismiss the current getting-started guide |
+| `GET /widgets/*` | User | htmx fragments for integration widgets (§5.3) |
+| `GET /img/*` | User | Proxied and cached images from integrations |
 | `GET /admin` | Admin | Status: OIDC state, override flag, Authentik reachability, version |
 | `GET/POST /admin/branding` | Admin | Title, logo upload, Markdown login message, footer links, theme colour |
 | `GET/POST /admin/auth` | Admin | OIDC + Authentik API config, Test & confirm |
-| `GET/POST /admin/apps` | Admin | Presentation overrides (v1.1) |
-| `GET/POST /admin/account` | Local admin | Change local admin password |
+| `GET/POST /admin/catalog` | Admin | Services, categories, sections, placements, unplaced apps, starter template, preview (§5.1) |
+| `GET/POST /admin/dashboard` | Admin | Getting-started guide and announcements (§5.2) |
+| `GET/POST /admin/integrations` | Admin | Integration settings, library-to-category mapping, test connection (§5.3) |
+| `GET/POST /admin/account` | Local admin | Account page, including changing the local admin password |
+| `GET/POST /admin/account/password` | Local admin (also allowed with a `password_change_required` session) | Change password; required after logging in with a generated password |
 | `GET /healthz` / `GET /readyz` | Public | Liveness / readiness (DB reachable) |
 
-The dashboard is responsive, supports light/dark mode, and works with the keyboard (`/` to focus search).
+The layout is described in §5.2. All pages are responsive, support light/dark mode, and work with the keyboard.
 
-## 7. Data model (SQLite)
+## 7. Data model
 
 ```sql
-local_users   (id, username UNIQUE, password_hash, must_change BOOL, created_at, updated_at)
-settings      (key PRIMARY KEY, value_json, updated_at)            -- branding, general prefs
+local_users   (id, username UNIQUE, password_hash, must_change BOOL,   -- true until a user sets the password
+               password_changed_at, created_at, updated_at)
+settings      (key PRIMARY KEY, value_json, updated_at)            -- branding, guide text + version, prefs
 oidc_configs  (id, state CHECK(state IN ('draft','confirmed','superseded')),
                issuer_url, client_id, client_secret_enc, scopes, claim_map_json,
-               admin_groups_json, discovery_mode, ak_base_url, ak_token_enc,
+               admin_groups_json, ak_base_url, ak_token_enc, ak_app_slug,
                tested_at, tested_by, confirmed_at, confirmed_by, created_at)
 sessions      (id PRIMARY KEY, user_kind, subject, data_enc, created_at, last_seen_at, expires_at)
-app_overrides (slug PRIMARY KEY, hidden, sort_order, category, icon_url, updated_at)   -- v1.1
+
+-- Catalog (§5.1)
+services      (id, source CHECK(source IN ('authentik','link')), ak_slug UNIQUE NULL,
+               name, url, icon, icon_upload_id, description, instructions_md, new_tab BOOL,
+               visibility CHECK(visibility IN ('all','groups')),  -- custom links only
+               enabled BOOL, created_at, updated_at)
+service_groups     (service_id REFERENCES services ON DELETE CASCADE, group_name,
+                    PRIMARY KEY (service_id, group_name))
+service_app_links  (id, service_id REFERENCES services ON DELETE CASCADE, platform, url, sort_order)
+categories    (id, slug UNIQUE, name, icon, intro_md, sort_order)
+sections      (id, category_id REFERENCES categories ON DELETE CASCADE, title,
+               kind CHECK(kind IN ('request','consume','other')), sort_order)
+placements    (section_id REFERENCES sections ON DELETE CASCADE,
+               service_id REFERENCES services ON DELETE CASCADE, note_md, sort_order,
+               PRIMARY KEY (section_id, service_id))
+
+-- Integrations (§5.3)
+integrations  (id, service_id UNIQUE REFERENCES services ON DELETE CASCADE, type, base_url,
+               api_key_enc, config_json, enabled BOOL, updated_at)
+integration_mappings (id, integration_id REFERENCES integrations ON DELETE CASCADE,
+               remote_library_id, category_id REFERENCES categories ON DELETE CASCADE,
+               visibility CHECK(visibility IN ('all','groups')), groups_json)
+
+-- Users and dashboard (§5.2)
+users         (sub PRIMARY KEY, username, email, last_login_at)   -- OIDC users, no credentials
+user_prefs    (sub PRIMARY KEY REFERENCES users, guide_dismissed_version)
+favourites    (sub REFERENCES users ON DELETE CASCADE, service_id REFERENCES services ON DELETE CASCADE,
+               sort_order, PRIMARY KEY (sub, service_id))
+announcements (id, body_md, starts_at, ends_at, groups_json, created_by, created_at)
 audit_log     (id, at, actor, action, detail_json)                  -- logins, config changes
+uploads       (id, kind, content_type, bytes BLOB/BYTEA, sha256, created_at)   -- logo, service icons
+meta          (key PRIMARY KEY, value)                              -- schema info, key check value
 ```
 
+Column types differ slightly between the two databases (for example `JSONB`/`TIMESTAMPTZ`/`BYTEA` on PostgreSQL, `TEXT`/`BLOB` on SQLite). Each database has its own migration files; the tables and meaning are the same.
+
+Uploaded files (logo, service icons) are stored in the database rather than on disk. With PostgreSQL, the container then needs no persistent volume, as long as the secret key is provided (§7.1).
+
 "OIDC confirmed" means: a row exists with `state='confirmed'`.
+
+### 7.1 Database choice: SQLite (default) or external PostgreSQL
+
+| | SQLite (default) | PostgreSQL (optional) |
+|---|---|---|
+| Enabled by | Nothing; used when `HEARTHPORT_DATABASE_URL` is unset | `HEARTHPORT_DATABASE_URL=postgres://…` (or `HEARTHPORT_DATABASE_URL_FILE`) |
+| Where data lives | `/data/hearthport.db` on the volume | The external server; `/data` only needed if the secret key is auto-generated there |
+| Supported versions | Bundled | PostgreSQL 14 or newer |
+| Backups | Copy the volume (or `hearthport backup`, which uses SQLite's online backup) | The server's usual tools (`pg_dump`, snapshots) |
+
+**Connecting**
+- A standard connection URL, e.g. `postgres://hearthport:…@db.example.com:5432/hearthport?sslmode=verify-full`. `sslmode`, `sslrootcert` and a `search_path` (to use a schema other than `public`) are set in the URL. `HEARTHPORT_CA_FILE` is also trusted for the database's TLS certificate.
+- Use `HEARTHPORT_DATABASE_URL_FILE` with a Docker secret to keep the password out of the environment. The password is always redacted in logs and on the admin status page.
+- Hearthport needs its own database, or its own schema, and a user who owns it. It can share a PostgreSQL server with Authentik, but must not use Authentik's database.
+- Pool settings: `HEARTHPORT_DB_MAX_CONNS` (default 10). Connections are checked on startup and by `/readyz`.
+
+**Startup**
+- If PostgreSQL isn't reachable yet (for example it's still starting in the same compose stack), Hearthport retries with backoff for up to `HEARTHPORT_DB_STARTUP_TIMEOUT` (default 60s), then exits with a clear error.
+- Migrations and the bootstrap-admin step (§4.1) run inside a PostgreSQL advisory lock. If two containers start at once, only one migrates and generates the admin password.
+
+**Secret key**
+- Encrypted values in the database (OIDC client secret, Authentik token, sessions) can only be read with the same secret key. With PostgreSQL the database may outlive the container, so the key must be kept too: either set `HEARTHPORT_SECRET_KEY` / `_FILE`, or keep `/data` on a persistent volume.
+- On first start Hearthport stores a small encrypted check value in `meta`. On each start it decrypts it. If that fails (wrong or lost key), Hearthport refuses to start and explains why, instead of silently failing to read the OIDC settings.
+
+**Switching an existing install from SQLite to PostgreSQL**
+- `hearthport migrate-db --to "$HEARTHPORT_DATABASE_URL"` copies every table from the current SQLite database into an empty PostgreSQL database, in one transaction, then checks row counts. Run it once with the container stopped, then set `HEARTHPORT_DATABASE_URL` and start as normal. Sessions are not copied, so users sign in again.
+- The same secret key must be used afterwards, because encrypted values are copied as-is.
 
 ## 8. Configuration (environment variables)
 
@@ -206,16 +518,21 @@ audit_log     (id, at, actor, action, detail_json)                  -- logins, c
 |---|---|---|
 | `HEARTHPORT_BASE_URL` | *(required for OIDC)* | Public URL, used to build the redirect URI and secure cookies |
 | `HEARTHPORT_LISTEN_ADDR` | `:8080` | Listen address |
-| `HEARTHPORT_DATA_DIR` | `/data` | SQLite DB, secret key, uploaded logo |
+| `HEARTHPORT_DATA_DIR` | `/data` | SQLite database and auto-generated secret key |
+| `HEARTHPORT_DATABASE_URL` / `_FILE` | — (use SQLite) | PostgreSQL connection URL. When set, PostgreSQL is used instead of SQLite (§7.1) |
+| `HEARTHPORT_DB_MAX_CONNS` | `10` | PostgreSQL connection pool size |
+| `HEARTHPORT_DB_STARTUP_TIMEOUT` | `60s` | How long to wait for PostgreSQL at startup |
 | `HEARTHPORT_ENABLE_LOCAL_LOGIN` | `false` | Break-glass: allow local login after OIDC is confirmed |
-| `HEARTHPORT_RESET_ADMIN_PASSWORD` | `false` | Regenerate and print the admin password on boot |
-| `HEARTHPORT_ADMIN_PASSWORD_FILE` | — | Seed the initial admin password from a file/secret |
-| `HEARTHPORT_SECRET_KEY` / `_FILE` | auto-generated to `/data/secret.key` | Key for at-rest encryption and cookie signing |
+| `HEARTHPORT_RESET_ADMIN_PASSWORD` | `false` | Put the admin password back into the regenerate-on-every-boot state (§4.1) |
+| `HEARTHPORT_SECRET_KEY` / `_FILE` | auto-generated to `/data/secret.key` | Key for at-rest encryption and cookie signing. Recommended with PostgreSQL (§7.1) |
 | `HEARTHPORT_TRUSTED_PROXIES` | — | CIDRs whose `X-Forwarded-*` headers are trusted |
 | `HEARTHPORT_SESSION_TTL` | `12h` | Absolute session lifetime |
 | `HEARTHPORT_APP_CACHE_TTL` | `60s` | Per-user app list cache |
+| `HEARTHPORT_STATUS_INTERVAL` | `60s` | How often service status checks run (§5.3) |
+| `HEARTHPORT_INTEGRATION_TIMEOUT` | `5s` | Timeout for each integration API call |
+| `HEARTHPORT_INTEGRATION_CACHE_TTL` | `5m` | Cache lifetime for integration lists (recently added, requests) |
 | `HEARTHPORT_LOG_LEVEL` / `_FORMAT` | `info` / `text` | Logging (`json` available) |
-| `HEARTHPORT_CA_FILE` | — | Extra CA bundle for a privately signed Authentik certificate |
+| `HEARTHPORT_CA_FILE` | — | Extra CA bundle for privately signed Authentik or PostgreSQL certificates |
 
 Environment variables control deployment and the break-glass behaviour.
 Everything about OIDC and branding lives in the web UI, as required.
@@ -228,8 +545,15 @@ Everything about OIDC and branding lives in the web UI, as required.
 - Secrets are never logged. The client secret and API token are write-only in the UI (shown as "••• set").
 - Outbound Authentik calls have timeouts, TLS verification is on (custom CA supported), and response sizes are capped.
 - Open-redirect protection: post-login `return_to` must be a relative path.
-- Uploaded logos are type-checked, size-capped, and re-served with a fixed content type.
+- Uploaded logos and icons are type-checked, size-capped, and re-served with a fixed content type.
+- All admin-written Markdown (login message, guide, announcements, category intros, service instructions, notes) is rendered and then sanitised with `bluemonday`. Only `http(s)` links are allowed.
+- Integrations:
+  - API keys are encrypted at rest, write-only in the UI, and never sent to the browser or logged.
+  - Outbound calls are limited to admin-configured hosts, with timeouts, size limits and no cross-host redirects.
+  - The image proxy only fetches from configured integration hosts.
+- Per-user integration data is always fetched for the signed-in user's own matched account and cached per user, never shared between users.
 - Container runs as a non-root user with a read-only root filesystem; only `/data` is writable.
+- PostgreSQL: TLS recommended (`sslmode=verify-full`); the connection password is read from a file/secret where possible and never logged; Hearthport's database user needs rights only on its own database or schema.
 
 ## 10. Docker packaging
 
@@ -262,6 +586,25 @@ services:
       - ./data:/data
 ```
 
+Example with PostgreSQL:
+```yaml
+services:
+  hearthport:
+    image: ghcr.io/kahooli/hearthport:latest
+    restart: unless-stopped
+    ports: ["8080:8080"]
+    environment:
+      HEARTHPORT_BASE_URL: https://portal.example.com
+      HEARTHPORT_DATABASE_URL_FILE: /run/secrets/hearthport_db_url
+      HEARTHPORT_SECRET_KEY_FILE: /run/secrets/hearthport_secret_key
+    secrets: [hearthport_db_url, hearthport_secret_key]
+secrets:
+  hearthport_db_url:
+    file: ./secrets/db_url            # postgres://hearthport:…@db.example.com:5432/hearthport?sslmode=verify-full
+  hearthport_secret_key:
+    file: ./secrets/secret_key        # e.g. output of: openssl rand -base64 32
+```
+
 Multi-arch images (`linux/amd64`, `linux/arm64`) are published to GHCR by a GitHub Actions workflow on tags.
 
 ## 11. Proposed repository layout
@@ -269,11 +612,19 @@ Multi-arch images (`linux/amd64`, `linux/arm64`) are published to GHCR by a GitH
 ```
 cmd/hearthport/           main.go (serve, reset-admin-password, healthcheck subcommands)
 internal/config/          env parsing
-internal/store/           SQLite, migrations (embedded), repositories
+internal/store/           Store interface + shared contract tests
+internal/store/sqlite/    SQLite implementation, queries, migrations
+internal/store/postgres/  PostgreSQL implementation, queries, migrations
 internal/crypto/          key management, AES-GCM, argon2id
 internal/auth/            local login, OIDC client, login-method policy, sessions, CSRF
-internal/authentik/       API client, app discovery modes A/B, cache
+internal/authentik/       API client, app discovery (service-account token), cache
+internal/catalog/         services, categories, sections, placements, per-user view building, starter template
+internal/dashboard/       guide, announcements, favourites
+internal/integrations/    Integration interface, registry, cache, image proxy
+  status/ seerr/ jellyfin/ plex/   one package per integration type
 internal/web/             router, handlers, middleware, templates/, static/
+assets/                   brand artwork source (SVG + generated PNG/ICO); copied into
+                          internal/web/static/brand/ at build time and embedded with go:embed
 docs/                     PLAN.md, authentik-setup.md
 deploy/                   docker-compose.yml examples
 Dockerfile, Makefile, .github/workflows/
@@ -283,13 +634,15 @@ Dockerfile, Makefile, .github/workflows/
 
 **Phase 0: Spike (short)**
 - Stand up Authentik in docker-compose for development. Create an OAuth2/OpenID provider + application and a few test apps with group bindings.
-- Verify app discovery via `for_user` (Mode A) and `goauthentik.io/api` (Mode B), and write down the permissions and claims actually needed.
+- Verify app discovery via `for_user` with a service-account token, including that Hearthport's own slug appears only for users bound to it. Write down the minimum service-account permissions and the claims actually needed.
+- Check the integration APIs against real instances: Seerr user lookup by email and requests by user, Jellyfin user lookup and `Items/Latest`, and Plex library sections and recently added. Record the API versions tested.
 
 **Phase 1: Skeleton & bootstrap**
-- Go module, config, SQLite + migrations, structured logging, `/healthz`.
-- Bootstrap admin with password banner, local login, sessions, CSRF, logout.
+- Go module, config, structured logging, `/healthz` and `/readyz`.
+- Store interface with SQLite and PostgreSQL implementations and migrations; startup retry, advisory lock and secret-key check (§7.1).
+- Bootstrap admin: password regenerated and printed on every boot until changed, forced password change on first login, local login, sessions, CSRF, logout.
 - Base layout/templates, login page with static branding.
-- Dockerfile and compose file; CI (lint with `golangci-lint`, `go test`, image build).
+- Dockerfile and compose files (SQLite and PostgreSQL); CI (lint with `golangci-lint`, `go test`, image build). Store tests run against both SQLite and a PostgreSQL service container.
 
 **Phase 2: Admin & OIDC**
 - Admin area; branding editor (title, logo, Markdown message sanitized with `bluemonday`).
@@ -297,30 +650,68 @@ Dockerfile, Makefile, .github/workflows/
 - Login-method policy + `HEARTHPORT_ENABLE_LOCAL_LOGIN` override; RP-initiated logout.
 - Admin role mapping from groups.
 
-**Phase 3: App discovery & dashboard**
-- Authentik API client, Mode A + Mode B, pagination, cache, stale fallback.
-- Dashboard tiles grouped by category, search, icons, open-in-new-tab.
+**Phase 3: App discovery, catalog & portal UI**
+- Authentik API client (service-account token), pagination, cache, stale fallback.
+- Access check at login and on refresh (§4.5).
+- Catalog: services (Authentik and custom links), categories, sections, placements, "Other", starter template, admin UI with preview (§5.1).
+- Portal layout with left category menu and mobile drawer; category pages with service cards, instructions and app links; search (§5.2).
+- Dashboard: getting-started guide, announcements, favourites, category overview cards (§5.2).
 
-**Phase 4: Hardening & release**
-- Security headers, rate limiting, audit log view, reset-password CLI.
-- Tests: unit tests (policy truth table, claim mapping, crypto), integration tests with a mock OIDC provider, and an end-to-end test (Playwright) against a real Authentik container in CI.
-- `docs/authentik-setup.md` (step-by-step provider, scope mapping, service account), multi-arch release to GHCR, v1.0.0.
+**Phase 4: Integrations**
+- Integration framework: interface, admin settings with test connection, encrypted keys, cache, htmx widgets, image proxy (§5.3).
+- Status checks for all services.
+- Seerr "Your requests", Jellyfin "Recently added", Plex "Recently added" with library-to-category mapping and visibility.
+
+**Phase 5: Hardening & release**
+- Security headers, rate limiting, audit log view, reset-password CLI, `backup` (SQLite) and `migrate-db` (SQLite → PostgreSQL) CLIs.
+- Tests:
+  - unit tests (login-method policy, claim mapping, crypto, catalog visibility rules)
+  - integration tests with a mock OIDC provider and mock Seerr/Jellyfin/Plex servers
+  - an end-to-end test (Playwright) against a real Authentik container in CI
+- `docs/authentik-setup.md` (step-by-step provider, scope mapping, service account), `docs/integrations.md`, multi-arch release to GHCR, v1.0.0.
 
 **Later (v1.1+)**
-- App presentation overrides, per-user favourites, back-channel logout, Prometheus `/metrics`, extra non-Authentik links shown to everyone or by group, i18n.
+- Progressive Web App: manifest, service worker, offline page, install prompt (§5.4). Later, optional push notifications.
+- More integrations: Audiobookshelf, Kavita, Komga, Tautulli.
+- Back-channel logout, Prometheus `/metrics`, i18n.
 
 ## 13. Acceptance criteria (v1)
-1. A fresh container prints admin credentials once. Logging in with them works; restarting does not print them again.
-2. Before OIDC is confirmed, only local login is offered.
-3. An admin can save OIDC settings, test them, and cannot confirm unless the test user is in an admin group.
-4. After confirmation, `/login` shows only the Authentik button and `POST /auth/local` returns 404.
-5. With `HEARTHPORT_ENABLE_LOCAL_LOGIN=true`, both options appear and local login works.
-6. Two Authentik users with different group bindings each see only their permitted apps. Removing a binding in Authentik removes the tile within the cache TTL.
-7. If Authentik is unreachable, the dashboard never shows apps the user wasn't previously permitted to see.
+1. A fresh container prints admin credentials. Restarting before a password change prints a **new** password, and the old one no longer works.
+2. Logging in with the generated password only gives access to the change-password page. After changing it, the admin can use the rest of the UI.
+3. After a user has changed the password, restarts print no password, and the user-chosen password keeps working.
+4. Before OIDC is confirmed, only local login is offered.
+5. An admin can save OIDC settings, test them, and cannot confirm unless the test user is in an admin group.
+6. After confirmation, `/login` shows only the Authentik button and `POST /auth/local` returns 404.
+7. With `HEARTHPORT_ENABLE_LOCAL_LOGIN=true`, both options appear and local login works.
+8. Two Authentik users with different group bindings each see only their permitted apps. Removing a binding in Authentik removes the tile within the cache TTL.
+9. If Authentik is unreachable, the dashboard never shows apps the user wasn't previously permitted to see.
+10. A user not bound to the Hearthport application in Authentik can't sign in. If their binding is removed, their session ends within the cache TTL.
+11. A custom-link service set to "all" is shown to every signed-in user. One limited to a group is shown only to members of that group. A `javascript:` URL is rejected.
+12. After login the user lands on the dashboard. The left menu lists only categories that contain at least one service the user can access, and collapses into a drawer on a phone-sized screen.
+13. A service placed in two categories (e.g. Plex in TV and Movies) appears in both. A Books category with Request, Read eBooks and Listen sections shows all three, in order, each with its services, instructions and app links.
+14. An Authentik app the user can access that isn't placed anywhere appears under "Other". "Other" is hidden when empty.
+15. The getting-started guide stays dismissed after the user dismisses it, and reappears when the admin publishes a new version. Announcements appear and expire on their dates and respect group targeting. Favourites persist across sessions.
+16. The Seerr widget shows only the signed-in user's own requests. The Jellyfin widget only shows items from libraries that user can access. A Plex section limited to a group isn't shown to others.
+17. No integration API key or token appears in any HTML, JavaScript, network response to the browser or log line.
+18. When a service is down, its status dot turns red and its widgets show "unavailable", and the dashboard and category pages still load promptly.
+19. With `HEARTHPORT_DATABASE_URL` unset, Hearthport uses SQLite. With it set, Hearthport uses PostgreSQL, and every other criterion passes on both.
+20. With PostgreSQL and no `/data` volume, Hearthport keeps its data across container recreation, as long as `HEARTHPORT_SECRET_KEY` is set. Starting with the wrong key fails with a clear error.
+21. `hearthport migrate-db` moves an existing SQLite install to PostgreSQL with no loss of settings, catalog, favourites or the admin password.
 
-## 14. Open questions
-1. Stack preference: Go + htmx as proposed, or would you prefer something else (e.g. Python/FastAPI or TypeScript/SvelteKit)?
-2. Default discovery mode: service-account token (A) or delegated user token (B)?
-3. Should non-admin OIDC users be allowed in at all by default, or only members of a configured "users" group? (Authentik can also enforce this with a policy on the Hearthport application itself, which is the recommended approach.)
-4. Force the bootstrap admin to change the password on first login, or keep it optional?
-5. Is there a need for extra links that don't come from Authentik (e.g. external bookmarks)?
+## 14. Decisions
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Stack | Go + htmx (§2) |
+| 2 | App discovery | Service-account token with `for_user` (§5) |
+| 3 | Who can sign in | Any user Authentik permits to access the Hearthport application (§4.5) |
+| 4 | Force bootstrap admin password change | Yes, on first login; password regenerated every boot until changed (§4.1) |
+| 5 | Extra non-Authentik links | Yes, admin-managed custom links with optional group visibility (§5.1) |
+| 6 | Database | SQLite by default; external PostgreSQL optional via `HEARTHPORT_DATABASE_URL` (§7.1) |
+| 7 | Portal structure | Dashboard home and a left category menu. Categories contain admin-defined sections (typed request / consume / other); a service can appear in many categories (§5.1, §5.2) |
+| 8 | Apps not placed in a category | Shown under an automatic "Other" category (§5.1) |
+| 9 | Dashboard content | Getting-started guide, announcements, favourites, category overview cards, live widgets (§5.2) |
+| 10 | Live data | In v1: status checks, Seerr, Jellyfin, Plex. Audiobookshelf, Kavita, Komga, Tautulli later (§5.3) |
+| 11 | Installable app | PWA in a later update (v1.1); v1 lays the groundwork (§5.4) |
+
+No open questions remain. Anything new that comes up in the Phase 0 spike will be added here.
