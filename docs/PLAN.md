@@ -200,6 +200,7 @@ Any Authentik user whose access to the Hearthport application is allowed in Auth
 
 - **Main gate, in Authentik:** the admin binds users, groups or policies to the Hearthport application in Authentik. Authentik refuses the authorization request for anyone else, so they never reach Hearthport's callback.
 - **Second check, in Hearthport:** at the OIDC callback, Hearthport fetches the user's permitted applications (§5). If the Hearthport application slug is not in the list, it shows a "you don't have access" page and creates no session. This catches mistakes such as the Hearthport application having no bindings at all, which Authentik treats as "allow everyone".
+- **Warning about open apps:** Authentik lets every user open an app with no bindings (its `core_default_app_access` flag, on by default). If the service account can read bindings, the admin status page lists such apps, so they aren't exposed to everyone by accident.
 - **Revocation:** on each app-list refresh (cache TTL, §5), if Hearthport's own slug has disappeared from the user's list, the session is ended and the user is sent to `/login`.
 - `admin` vs `user` role is decided separately by the admin group(s) (§4.4). Access to Hearthport doesn't depend on group names configured in Hearthport.
 
@@ -211,16 +212,25 @@ application's policy/group/user bindings. Its own *My applications* page uses
 user can access. Hearthport reuses that decision instead of copying policies.
 
 **Decision: service-account token.**
-- The admin creates an Authentik service account and an API token for it, with permission to view applications and users (minimum permissions to be confirmed in the Phase 0 spike).
-- Hearthport calls `GET /api/v3/core/applications/?for_user=<pk>&page_size=100` (following pagination), where `<pk>` is the Authentik user ID.
-- The user's `pk` is found by `GET /api/v3/core/users/?username=<preferred_username>` at login and stored in the session. If a custom `ak_user_pk` claim is added via an Authentik scope mapping, it is used instead.
+- The admin creates an Authentik service account, then an **API-intent token** for it under *Directory → Tokens and App passwords*. The token shown when the service account is created is an app password, which the API rejects.
+- The service account gets a role (e.g. `hearthport-discovery`) with these permissions:
+  - **`authentik_core.view_user_applications`**, required for `for_user`. Without it Authentik answers `400 "User not found"`; Hearthport's setup check explains this.
+  - **`authentik_core.view_user`**, only needed if the user's pk comes from a username lookup (see below).
+  - Optionally **`authentik_policies.view_policybinding`**, so Hearthport can warn about apps with no bindings (§4.5).
+- Hearthport calls `GET /api/v3/core/applications/?for_user=<pk>&page_size=100`, where `<pk>` is the Authentik user ID. Authentik pages the list **before** filtering it per user, so a page can be short or empty while more follow. Hearthport follows `pagination.next` until it is 0 and ignores `count`, which is the total of all apps.
+- **Finding the user's pk:** the setup guide recommends a custom scope mapping that adds an `ak_pk` claim (`return {"ak_pk": request.user.pk}`), so no user lookup or `view_user` is needed. Without the claim, Hearthport looks the pk up with `GET /api/v3/core/users/?username=<preferred_username>` at login. Either way the pk is stored in the session. (The default `sub` is a hashed ID that the users API can't filter by.)
+- **Never use `check_access`:** `/core/applications/<slug>/check_access/` only honours `for_user` for superuser tokens. For any other token it silently checks the token's own account.
 - User tokens never get API access, and the behaviour is the same for every user.
 - Not planned for v1: using the user's own token (via Authentik's `goauthentik.io/api` scope). It would give the portal API access as each user, which is too powerful for Authentik admins.
 
-> **Spike (Phase 0):** confirm, against the target Authentik version, that `for_user` gives the same results as the user's own library view (including `superuser_full_list` behaviour for Authentik superusers), and the minimum permissions the service account needs.
+> **Phase 0 result:** confirmed on Authentik 2026.8.3. `for_user` matches each user's group bindings exactly. See [docs/spike/phase0.md](spike/phase0.md).
 
 Handling the results:
-- Fields used: `name`, `slug`, `group`, `meta_launch_url` (falls back to the provider's launch URL), `meta_icon`, `meta_description`, `meta_publisher`, `open_in_new_tab`.
+- Fields used:
+  - `name`, `slug`, `group`, `meta_description`, `meta_publisher`, `open_in_new_tab`
+  - `launch_url`: already resolved from `meta_launch_url` or the provider; empty when there isn't one
+  - `meta_icon_url`, and `meta_icon_themed_urls` for light and dark icons
+  - `meta_hide`: an app the admin hid in Authentik isn't shown
 - Apps with no launch URL are skipped. The Hearthport app itself is hidden, but its presence is used for the access check (§4.5).
 - Icons: relative `meta_icon` paths are resolved against the Authentik base URL. Optionally Hearthport proxies and caches icons so the browser never calls Authentik's API directly.
 - **Cache**: per-user, in memory, TTL 60s (configurable), cleared on login. A "refresh" button bypasses it.
@@ -351,6 +361,10 @@ Integrations add live information from the services themselves.
 
 **Seerr (Overseerr / Jellyseerr / Seerr)**
 - The user is matched to a Seerr user by email (default) or username. The match is cached.
+  - Seerr's `?q=` search is a substring search, so only an **exact, case-insensitive** match counts. Zero or several matches mean "not linked".
+  - Users Seerr imported from Jellyfin have their username as their email until they set one, so username matching is the fallback for them.
+- Every call for a user sends the API key **and `X-API-User: <seerr id>`**. Seerr then acts as that user and refuses to return anyone else's requests, even if Hearthport has a bug.
+- Request results contain only TMDB IDs. Titles and posters come from Seerr's `/movie/{id}` and `/tv/{id}`, cached for a day. A request still shows if that lookup fails.
 - **"Your requests" widget**: the user's recent requests with their title, poster and status (pending, approved, available, declined), each linking to the item in Seerr.
 - Only the matched user's own requests are shown. If there's no match, the widget explains that the user needs to sign in to Seerr first.
 
@@ -361,7 +375,13 @@ Integrations add live information from the services themselves.
 
 **Plex**
 - **"Recently added" widget** per library section, using the Plex server token. The admin maps Plex library sections to Hearthport categories.
-- Limitation: Plex's server API doesn't cheaply tell us which libraries are shared with each user. Each mapped section therefore has its own visibility setting: all users, or selected Authentik groups. The admin must set this to match their Plex sharing.
+- **Per-user library access:** the Plex server API doesn't say which libraries are shared with each user. Two other sources do, and Hearthport uses the first that works:
+  1. plex.tv `GET /api/servers/<machineIdentifier>/shared_servers` with the owner's token: one `SharedServer` per user with `Section shared="1"` entries. Each user's access token in that response is ignored and never stored.
+  2. Tautulli `cmd=get_users`, which returns `shared_libraries` for each user. This needs a Tautulli integration.
+
+  The Hearthport user is matched to the Plex user by email or username.
+- **Fallback:** if neither source works, each mapped section has its own visibility setting (all users or selected Authentik groups), which the admin sets to match their Plex sharing.
+- Both sources still need confirming on a real claimed server; the probe tool checks them (docs/spike/phase0.md).
 
 **Later (v1.x)**: Audiobookshelf, Kavita, Komga and Tautulli, built on the same interface.
 
@@ -611,6 +631,8 @@ Multi-arch images (`linux/amd64`, `linux/arm64`) are published to GHCR by a GitH
 
 ```
 cmd/hearthport/           main.go (serve, reset-admin-password, healthcheck subcommands)
+cmd/hearthport-probe/     read-only API checks against real servers (Phase 0)
+internal/probe/           checks used by hearthport-probe, with unit tests
 internal/config/          env parsing
 internal/store/           Store interface + shared contract tests
 internal/store/sqlite/    SQLite implementation, queries, migrations
@@ -627,15 +649,20 @@ assets/                   brand artwork source (SVG + generated PNG/ICO); copied
                           internal/web/static/brand/ at build time and embedded with go:embed
 docs/                     PLAN.md, authentik-setup.md
 deploy/                   docker-compose.yml examples
+deploy/dev/               throwaway test stack (compose.spike.yml) and seed.py
 Dockerfile, Makefile, .github/workflows/
 ```
 
 ## 12. Roadmap
 
-**Phase 0: Spike (short)**
-- Stand up Authentik in docker-compose for development. Create an OAuth2/OpenID provider + application and a few test apps with group bindings.
-- Verify app discovery via `for_user` with a service-account token, including that Hearthport's own slug appears only for users bound to it. Write down the minimum service-account permissions and the claims actually needed.
-- Check the integration APIs against real instances: Seerr user lookup by email and requests by user, Jellyfin user lookup and `Items/Latest`, and Plex library sections and recently added. Record the API versions tested.
+**Phase 0: Spike (done, 2026-10-01; see [docs/spike/phase0.md](spike/phase0.md))**
+- A throwaway stack (`deploy/dev/compose.spike.yml`) with Authentik 2026.8, Seerr 3.5, Jellyfin 12.1 and Plex 1.43, seeded by `deploy/dev/seed.py`.
+- Confirmed: `for_user` app discovery and the minimum service-account permissions; Seerr per-user requests with `X-API-User`; Jellyfin per-user recently added; Plex sections and recently added.
+- A read-only probe tool (`cmd/hearthport-probe`) for checking real servers.
+- **Still to confirm on the real network** (blocked from the build sandbox):
+  - Seerr title lookups (TMDB)
+  - the `seerrng` fork's API
+  - Plex per-user sharing via plex.tv and Tautulli
 
 **Phase 1: Skeleton & bootstrap**
 - Go module, config, structured logging, `/healthz` and `/readyz`.
@@ -668,7 +695,7 @@ Dockerfile, Makefile, .github/workflows/
   - unit tests (login-method policy, claim mapping, crypto, catalog visibility rules)
   - integration tests with a mock OIDC provider and mock Seerr/Jellyfin/Plex servers
   - an end-to-end test (Playwright) against a real Authentik container in CI
-- `docs/authentik-setup.md` (step-by-step provider, scope mapping, service account), `docs/integrations.md`, multi-arch release to GHCR, v1.0.0.
+- `docs/authentik-setup.md` (step-by-step provider, `ak_pk` scope mapping, service account with an API-intent token and the `hearthport-discovery` role), `docs/integrations.md`, multi-arch release to GHCR, v1.0.0.
 
 **Later (v1.1+)**
 - Progressive Web App: manifest, service worker, offline page, install prompt (§5.4). Later, optional push notifications.

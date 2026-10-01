@@ -1,0 +1,10 @@
+# Build output
+/bin/
+/dist/
+/hearthport
+/hearthport-probe
+
+# Local env files and probe reports may contain tokens or personal data
+.env
+*.env.sh
+probe-report*.md
