@@ -16,7 +16,7 @@
 | G10 | Admins can share extra links in the portal | Services can also be custom links, shown to all signed-in users or only to chosen Authentik groups (§5.1) |
 | G11 | Optionally use an external PostgreSQL server | Built-in SQLite by default; set `HEARTHPORT_DATABASE_URL` to use PostgreSQL instead (§7.1) |
 | G12 | An easy overview of each user's services and how to use them | A dashboard home page and a left-hand category menu (TV, Movies, Books, Comics, …). Each category page shows how to **request** (e.g. Seerr) and how to **consume** (e.g. Plex), with instructions and app download links (§5.1, §5.2) |
-| G13 | Live information from the services themselves | Integrations: status checks for every service, plus Seerr requests and Jellyfin/Plex recently added (§5.3) |
+| G13 | Live information from the services themselves | Integrations: status checks for every service, plus Seerr requests and Plex recently added (§5.3) |
 
 ### Non-goals (v1)
 - Acting as a reverse proxy or forward-auth provider (Authentik's outposts already do this).
@@ -84,7 +84,7 @@ The artwork in [`assets/`](../assets/README.md) is the **default branding**. Adm
             │  Key: HEARTHPORT_SECRET_KEY or /data/secret.key                   │
             └──────┬─────────────────────────────┬─────────────────┬────────────┘
                    │ OIDC (discovery, token,     │ REST API        │ Integrations (server-side only)
-                   │ JWKS, end-session)          │ applications    │ status checks, Seerr, Jellyfin, Plex
+                   │ JWKS, end-session)          │ applications    │ status checks, Seerr, Plex
                    ▼                             ▼                 ▼
             ┌──────────────────── Authentik ─────────────┐   ┌──── Your services ────┐
             └────────────────────────────────────────────┘   └───────────────────────┘
@@ -247,7 +247,7 @@ Category: Books                     (left menu item)
  └─ Section: Listen         [consume]   → Audiobookshelf
 Category: TV
  ├─ Section: Request        [request]   → Seerr        "Search for the show, then Request"
- └─ Section: Watch          [consume]   → Plex, Jellyfin
+ └─ Section: Watch          [consume]   → Plex
 ```
 
 **Service**: one entry per thing a user can use (Plex, Seerr, Kavita, a wiki, …).
@@ -325,7 +325,7 @@ Category: TV
   - **Get the app** buttons, one per platform link
   - an expandable **How to use** panel with the Markdown instructions
   - a ☆ button to add or remove it from favourites
-  - integration widgets where configured, e.g. "Recently added to TV" from Plex or Jellyfin
+  - integration widgets where configured, e.g. "Recently added to TV" from Plex
 
 **Dashboard** (`/`, the home page after login), top to bottom:
 1. **Getting started guide**: admin-written Markdown for new users, e.g. accepting invites and installing apps. Each user can dismiss it. When the admin publishes a new version, it's shown again to everyone.
@@ -334,7 +334,7 @@ Category: TV
    - Each can be targeted at all users or only at selected Authentik groups.
 3. **Favourites**: the services this user has starred, as compact one-click launch tiles. If empty, it explains how to star a service.
 4. **Your services**: one overview card per category the user can access. Each card shows the category's sections with their services' icons, a quick **Request** button (the first request service) and an **Open** button (the first consume service), and links to the category page.
-5. **Live widgets** (§5.3): "Your requests" (Seerr), "Recently added" (Jellyfin/Plex), and a service status summary.
+5. **Live widgets** (§5.3): "Your requests" (Seerr), "Recently added" (Plex), and a service status summary.
 
 **Per-user data**: favourites and the dismissed guide version are stored against the user's Authentik `sub` in a small `users` table. This is created on first login and holds no passwords.
 
@@ -368,11 +368,6 @@ Integrations add live information from the services themselves.
 - **"Your requests" widget**: the user's recent requests with their title, poster and status (pending, approved, available, declined), each linking to the item in Seerr.
 - Only the matched user's own requests are shown. If there's no match, the widget explains that the user needs to sign in to Seerr first.
 
-**Jellyfin**
-- The user is matched to a Jellyfin user by username (default) or email.
-- **"Recently added" widget**: calls `/Users/{id}/Items/Latest` as that Jellyfin user, so results respect the user's library access in Jellyfin.
-- The admin maps Jellyfin libraries to Hearthport categories, so TV pages show TV additions and so on.
-
 **Plex**
 - **"Recently added" widget** per library section, using the Plex server token. The admin maps Plex library sections to Hearthport categories.
 - **Per-user library access:** the Plex server API doesn't say which libraries are shared with each user. Two other sources do, and Hearthport uses the first that works:
@@ -383,7 +378,11 @@ Integrations add live information from the services themselves.
 - **Fallback:** if neither source works, each mapped section has its own visibility setting (all users or selected Authentik groups), which the admin sets to match their Plex sharing.
 - Both sources still need confirming on a real claimed server; the probe tool checks them (docs/spike/phase0.md).
 
-**Later (v1.x)**: Audiobookshelf, Kavita, Komga and Tautulli, built on the same interface.
+**Later (v1.x)**: Jellyfin, Audiobookshelf, Kavita, Komga and Tautulli, built on the same interface.
+- **Jellyfin design note** (from Phase 0, confirmed on Jellyfin 12.1.0):
+  - Match users by username, with email as an alternative.
+  - `GET /Items/Latest?userId=<id>` with a single API key returns only items from libraries that user can access.
+  - The admin maps Jellyfin libraries to categories.
 
 **Safety**
 - Only admins can set integration URLs.
@@ -643,7 +642,7 @@ internal/authentik/       API client, app discovery (service-account token), cac
 internal/catalog/         services, categories, sections, placements, per-user view building, starter template
 internal/dashboard/       guide, announcements, favourites
 internal/integrations/    Integration interface, registry, cache, image proxy
-  status/ seerr/ jellyfin/ plex/   one package per integration type
+  status/ seerr/ plex/      one package per integration type
 internal/web/             router, handlers, middleware, templates/, static/
 assets/                   brand artwork source (SVG + generated PNG/ICO); copied into
                           internal/web/static/brand/ at build time and embedded with go:embed
@@ -669,7 +668,7 @@ Dockerfile, Makefile, .github/workflows/
 - Store interface with SQLite and PostgreSQL implementations and migrations; startup retry, advisory lock and secret-key check (§7.1).
 - Bootstrap admin: password regenerated and printed on every boot until changed, forced password change on first login, local login, sessions, CSRF, logout.
 - Base layout/templates, login page with static branding.
-- Dockerfile and compose files (SQLite and PostgreSQL); CI (lint with `golangci-lint`, `go test`, image build). Store tests run against both SQLite and a PostgreSQL service container.
+- Dockerfile and compose files (SQLite and PostgreSQL); CI (lint with `golangci-lint`, `go test`, image build). Store tests run against SQLite and against PostgreSQL 14 (oldest supported) and 18 (the project owner's deployment) as service containers.
 
 **Phase 2: Admin & OIDC**
 - Admin area; branding editor (title, logo, Markdown message sanitized with `bluemonday`).
@@ -687,19 +686,19 @@ Dockerfile, Makefile, .github/workflows/
 **Phase 4: Integrations**
 - Integration framework: interface, admin settings with test connection, encrypted keys, cache, htmx widgets, image proxy (§5.3).
 - Status checks for all services.
-- Seerr "Your requests", Jellyfin "Recently added", Plex "Recently added" with library-to-category mapping and visibility.
+- Seerr "Your requests", and Plex "Recently added" with library-to-category mapping and per-user library access (plex.tv or Tautulli, with group visibility as the fallback).
 
 **Phase 5: Hardening & release**
 - Security headers, rate limiting, audit log view, reset-password CLI, `backup` (SQLite) and `migrate-db` (SQLite → PostgreSQL) CLIs.
 - Tests:
   - unit tests (login-method policy, claim mapping, crypto, catalog visibility rules)
-  - integration tests with a mock OIDC provider and mock Seerr/Jellyfin/Plex servers
+  - integration tests with a mock OIDC provider and mock Seerr and Plex servers
   - an end-to-end test (Playwright) against a real Authentik container in CI
 - `docs/authentik-setup.md` (step-by-step provider, `ak_pk` scope mapping, service account with an API-intent token and the `hearthport-discovery` role), `docs/integrations.md`, multi-arch release to GHCR, v1.0.0.
 
 **Later (v1.1+)**
 - Progressive Web App: manifest, service worker, offline page, install prompt (§5.4). Later, optional push notifications.
-- More integrations: Audiobookshelf, Kavita, Komga, Tautulli.
+- More integrations: Jellyfin, Audiobookshelf, Kavita, Komga, Tautulli.
 - Back-channel logout, Prometheus `/metrics`, i18n.
 
 ## 13. Acceptance criteria (v1)
@@ -718,7 +717,7 @@ Dockerfile, Makefile, .github/workflows/
 13. A service placed in two categories (e.g. Plex in TV and Movies) appears in both. A Books category with Request, Read eBooks and Listen sections shows all three, in order, each with its services, instructions and app links.
 14. An Authentik app the user can access that isn't placed anywhere appears under "Other". "Other" is hidden when empty.
 15. The getting-started guide stays dismissed after the user dismisses it, and reappears when the admin publishes a new version. Announcements appear and expire on their dates and respect group targeting. Favourites persist across sessions.
-16. The Seerr widget shows only the signed-in user's own requests. The Jellyfin widget only shows items from libraries that user can access. A Plex section limited to a group isn't shown to others.
+16. The Seerr widget shows only the signed-in user's own requests. A Plex library not shared with a user (according to plex.tv or Tautulli, or the group fallback) isn't shown to them.
 17. No integration API key or token appears in any HTML, JavaScript, network response to the browser or log line.
 18. When a service is down, its status dot turns red and its widgets show "unavailable", and the dashboard and category pages still load promptly.
 19. With `HEARTHPORT_DATABASE_URL` unset, Hearthport uses SQLite. With it set, Hearthport uses PostgreSQL, and every other criterion passes on both.
@@ -734,11 +733,12 @@ Dockerfile, Makefile, .github/workflows/
 | 3 | Who can sign in | Any user Authentik permits to access the Hearthport application (§4.5) |
 | 4 | Force bootstrap admin password change | Yes, on first login; password regenerated every boot until changed (§4.1) |
 | 5 | Extra non-Authentik links | Yes, admin-managed custom links with optional group visibility (§5.1) |
-| 6 | Database | SQLite by default; external PostgreSQL optional via `HEARTHPORT_DATABASE_URL` (§7.1) |
+| 6 | Database | SQLite by default; external PostgreSQL optional via `HEARTHPORT_DATABASE_URL` (§7.1). The project owner's own deployment uses PostgreSQL 18. |
 | 7 | Portal structure | Dashboard home and a left category menu. Categories contain admin-defined sections (typed request / consume / other); a service can appear in many categories (§5.1, §5.2) |
 | 8 | Apps not placed in a category | Shown under an automatic "Other" category (§5.1) |
 | 9 | Dashboard content | Getting-started guide, announcements, favourites, category overview cards, live widgets (§5.2) |
-| 10 | Live data | In v1: status checks, Seerr, Jellyfin, Plex. Audiobookshelf, Kavita, Komga, Tautulli later (§5.3) |
+| 10 | Live data | In v1: status checks, Seerr, Plex. Jellyfin, Audiobookshelf, Kavita, Komga and Tautulli later (§5.3) |
 | 11 | Installable app | PWA in a later update (v1.1); v1 lays the groundwork (§5.4) |
+| 12 | Jellyfin | Moved to later; the target server runs Plex. The Phase 0 findings are kept in §5.3 (2026-10-02) |
 
 No open questions remain. Anything new that comes up in the Phase 0 spike will be added here.

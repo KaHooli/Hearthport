@@ -115,9 +115,9 @@ Applied to [`docs/PLAN.md`](../PLAN.md) in the same change:
 - **§5.3 Plex:** use per-user sharing from plex.tv, or Tautulli, when available; fall back to group visibility.
 - **§12 Phase 0:** marked done, with the remaining real-network checks listed.
 
-**Not changed yet; for the project owner to decide:**
-- The target server runs **Plex, Tautulli and Audiobookshelf, not Jellyfin**. Should Jellyfin move to "later" and **Audiobookshelf or Tautulli** come into v1?
-- The target server already runs **PostgreSQL 18**, which Hearthport could use (§7.1).
+**Decided by the project owner (2026-10-02):**
+- **Jellyfin moves to "later"**, because the target server runs Plex. Its design note stays in §5.3.
+- **SQLite stays the default**, and PostgreSQL is used when `HEARTHPORT_DATABASE_URL` is set. The owner's deployment will use their existing PostgreSQL 18 server, so CI tests the store against PostgreSQL 14 and 18.
 
 ## Running the probe against your servers
 
@@ -146,4 +146,4 @@ go run ./cmd/hearthport-probe
 docker compose -f deploy/dev/compose.spike.yml down -v   # when finished
 ```
 
-The stack uses fixed development passwords and must not be exposed to a network.
+The stack uses fixed development passwords and must not be exposed to a network. It keeps a Jellyfin container even though Jellyfin integration is postponed, because the test Seerr needs a media server to sign its users in.
