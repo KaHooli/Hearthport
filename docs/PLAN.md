@@ -149,15 +149,74 @@ The OIDC config has three states: **none → draft → confirmed**.
 | `draft` | Saved but not yet proven to work | Local login only (+ "Test OIDC" button for admins) |
 | `confirmed` | An admin completed a successful test login | **OIDC only** (unless the §4.3 override is set) |
 
-Admin → Authentication page fields:
+Admin → Authentication offers three ways to create the draft. All three end in the same draft and the same *Test & confirm* step below. The approach follows [nextrmnl](https://github.com/DerKezorm/nextrmnl)'s Authentik button.
+
+#### 4.2.1 "Set up with Authentik" (recommended)
+
+The admin enters two things:
+- the **Authentik address**
+- a **one-time API token** from an Authentik superuser (e.g. a token with a 1-hour expiry, deleted afterwards)
+
+They can also enter:
+- their own Authentik **username**, to be added to the admin group so they can't lock themselves out
+- which existing Authentik **groups** may use Hearthport (default: create `hearthport-users`)
+
+Hearthport then makes, through the Authentik API, everything an admin would otherwise click together in a dozen forms. Each step is shown as it runs with ✓ or ✗ and Authentik's HTTP status; the first failure stops the run.
+
+| # | Step | What Hearthport does |
+|---|---|---|
+| 1 | Reach | `GET /admin/version/`; shows the version and warns if it's older than the oldest tested |
+| 2 | Signing key | Finds or generates the certificate `hearthport` (`/crypto/certificatekeypairs/generate/`, RSA, 10 years) |
+| 3 | Scope mapping | Finds or creates `Hearthport: ak_pk` (scope `hearthport`, `return {"ak_pk": request.user.pk}`) and looks up Authentik's managed `openid`, `profile` and `email` mappings. `profile` already includes the `groups` claim |
+| 4 | Provider | Finds or creates OAuth2 provider `hearthport` (§4.2.4) |
+| 5 | Application | Finds or creates application `hearthport`: launch URL `{BASE_URL}/`, description "Your apps, all in one place", icon `{BASE_URL}/static/brand/icon-192.png` |
+| 6 | Groups and access | Finds or creates `hearthport-users` (or uses the chosen groups) and `hearthport-admins`, binds both to the application, and adds the given username to `hearthport-admins`. **The application is never left without bindings**, because Authentik would then open it to every user (§4.5) |
+| 7 | Discovery account | Finds or creates service account `hearthport-discovery`, an **API-intent** token for it, and role `hearthport-discovery` with `authentik_core.view_user_applications` and `authentik_policies.view_policybinding` (§5) |
+| 8 | Fill in | Stores issuer, client ID and secret, the discovery token (encrypted), the app slug and the admin group as a **draft**, then confirms the issuer with one discovery call |
+
+**Rules for the setup run**
+- **The one-time token** is used for these calls only. It is never stored or logged, and error messages show Authentik's status code and content type, never the token.
+- **Error responses aren't echoed to the browser.** The address comes from the admin and could point at any service, so the response body goes to the server log only.
+- **Running it again is safe:** each object is found by its exact name or slug and updated in place (`PATCH`). Client ID, secret and tokens are kept, and a changed `{BASE_URL}` updates the redirect URI.
+- **Partial runs are kept:** steps that succeeded before a failure stay in Authentik, and the next run picks them up.
+- **Confirmation is still required.** The admin must still run *Test & confirm*; the setup run never switches login methods on its own.
+
+Tested on Authentik 2026.8.3 (docs/spike/phase0.md, addendum): a real sign-in through the created provider returned `ak_pk`, `groups` and a UUID `sub`. A user outside the bound groups got Authentik's "Permission denied" page and never reached the callback. Running the setup twice changed nothing.
+
+#### 4.2.2 Blueprint download (no token handed over)
+
+For admins who would rather not give Hearthport a superuser token, Hearthport offers a **blueprint** (`hearthport-authentik.yaml`) that creates the same objects.
+- **Generated secrets:** Hearthport generates the client ID, client secret and discovery-token key itself, writes them into the blueprint, and stores them in the draft at the same moment. After the admin imports the file, nothing needs copying back.
+- **Importing:** under *Customization → Blueprints*, or by dropping the file into the worker's `blueprints/custom/` folder.
+- **Contents:** the groups, the `ak_pk` scope mapping, the provider (with the preset `client_id` and `client_secret`), the application, two group bindings, the role with its permissions, the service account (`type: service_account`, `roles: [role]`) and its API token (`key:` preset).
+- **Signing key:** Authentik's default self-signed certificate, because a blueprint can't generate one.
+- **The file contains secrets.** It is downloaded once, shown with a warning to delete it after importing, and never kept by Hearthport.
+- **Tested:** imported through `POST /api/v3/managed/blueprints/import/` on Authentik 2026.8.3. Signing in with the preset client secret worked, and the preset token listed apps for a given user.
+
+#### 4.2.3 Manual setup
+
+The original form, for other setups or for admins who prefer to do it by hand. Admin → Authentication page fields:
 - Issuer URL (e.g. `https://auth.example.com/application/o/hearthport/`), fetched via `.well-known/openid-configuration`
 - Client ID, client secret (encrypted at rest)
-- Scopes (default `openid profile email groups`; see §5)
+- Scopes (default `openid profile email hearthport`). Authentik's `profile` scope carries `groups`, and `hearthport` carries `ak_pk` when that mapping exists (see §5)
 - Claim mappings: username (`preferred_username`), display name (`name`), email, groups (`groups`)
 - **Admin group(s)**: Authentik group names whose members become Hearthport admins (e.g. `hearthport-admins`)
 - Authentik API settings for app discovery (§5): base URL, service-account API token (encrypted)
 - Hearthport's application slug in Authentik (default `hearthport`), used for the access check in §4.5
 - Read-only: the redirect URI to paste into Authentik (`{BASE_URL}/auth/oidc/callback`)
+- A link to `docs/authentik-setup.md`, which walks through the same objects as §4.2.1 by hand
+
+#### 4.2.4 Provider settings (all three ways)
+
+- **Client type:** `confidential`.
+- **`grant_types: [authorization_code]`.** Since Authentik 2026.8, a provider created through the API without `grant_types` gets an empty list, and every sign-in is refused with `invalid_request`. This was reproduced in Phase 0. Hearthport keeps no refresh tokens, so it needs no other grant.
+- **Redirect URI:** `{BASE_URL}/auth/oidc/callback`, strict matching.
+- **Flows:** `default-provider-authorization-implicit-consent`, falling back to the first authorization flow, and `default-provider-invalidation-flow`.
+- **`sub_mode: user_uuid`**, a stable ID that the users API can also filter by.
+- **`include_claims_in_id_token: true`.**
+- **Property mappings:** managed `openid`, `profile` and `email`, plus `Hearthport: ak_pk`.
+- **`email_verified` is ignored:** Authentik's managed email mapping returns `false` since 2025.10. Hearthport identifies users by `sub`, not email, so this doesn't matter; email is used only for matching to Seerr or Plex.
+
 
 **Test & confirm flow** (stops admins locking themselves out):
 1. The admin clicks *Test & confirm*. Hearthport runs discovery and shows any errors inline.
@@ -218,7 +277,7 @@ user can access. Hearthport reuses that decision instead of copying policies.
   - **`authentik_core.view_user`**, only needed if the user's pk comes from a username lookup (see below).
   - Optionally **`authentik_policies.view_policybinding`**, so Hearthport can warn about apps with no bindings (§4.5).
 - Hearthport calls `GET /api/v3/core/applications/?for_user=<pk>&page_size=100`, where `<pk>` is the Authentik user ID. Authentik pages the list **before** filtering it per user, so a page can be short or empty while more follow. Hearthport follows `pagination.next` until it is 0 and ignores `count`, which is the total of all apps.
-- **Finding the user's pk:** the setup guide recommends a custom scope mapping that adds an `ak_pk` claim (`return {"ak_pk": request.user.pk}`), so no user lookup or `view_user` is needed. Without the claim, Hearthport looks the pk up with `GET /api/v3/core/users/?username=<preferred_username>` at login. Either way the pk is stored in the session. (The default `sub` is a hashed ID that the users API can't filter by.)
+- **Finding the user's pk:** setup (§4.2.1, §4.2.2) creates a scope mapping that adds an `ak_pk` claim (`return {"ak_pk": request.user.pk}`), so no user lookup and no `view_user` permission is needed. This was confirmed with a real sign-in. If the claim is missing (manual setup without the mapping), Hearthport looks the pk up with `GET /api/v3/core/users/?username=<preferred_username>` at login, which needs `view_user`. Either way the pk is stored in the session.
 - **Never use `check_access`:** `/core/applications/<slug>/check_access/` only honours `for_user` for superuser tokens. For any other token it silently checks the token's own account.
 - User tokens never get API access, and the behaviour is the same for every user.
 - Not planned for v1: using the user's own token (via Authentik's `goauthentik.io/api` scope). It would give the portal API access as each user, which is too powerful for Authentik admins.
@@ -674,6 +733,7 @@ Dockerfile, Makefile, .github/workflows/
 - Admin area; branding editor (title, logo, Markdown message sanitized with `bluemonday`).
 - OIDC config draft/test/confirm lifecycle; encrypted secrets.
 - Login-method policy + `HEARTHPORT_ENABLE_LOCAL_LOGIN` override; RP-initiated logout.
+- "Set up with Authentik" (one-time token) and blueprint download (§4.2.1, §4.2.2), tested against the throwaway Authentik in CI.
 - Admin role mapping from groups.
 
 **Phase 3: App discovery, catalog & portal UI**
@@ -740,5 +800,6 @@ Dockerfile, Makefile, .github/workflows/
 | 10 | Live data | In v1: status checks, Seerr, Plex. Jellyfin, Audiobookshelf, Kavita, Komga and Tautulli later (§5.3) |
 | 11 | Installable app | PWA in a later update (v1.1); v1 lays the groundwork (§5.4) |
 | 12 | Jellyfin | Moved to later; the target server runs Plex. The Phase 0 findings are kept in §5.3 (2026-10-02) |
+| 13 | Authentik setup | One-button setup with a one-time token, or a generated blueprint, following nextrmnl; manual setup stays available (§4.2.1–§4.2.3) |
 
 No open questions remain. Anything new that comes up in the Phase 0 spike will be added here.

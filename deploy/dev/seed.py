@@ -95,10 +95,15 @@ def seed_authentik():
     authz, inval = flow("authorization", "implicit"), flow("invalidation", "provider")
     key = must(ak("GET", "/crypto/certificatekeypairs/?has_key=true"), "keys")["results"][0]["pk"]
     maps = [m["pk"] for m in must(ak("GET", "/propertymappings/provider/scope/?managed__startswith=goauthentik.io/providers/oauth2/scope-"), "maps")["results"]]
-    provider = ak_get_or_create("/providers/oauth2/", "name", "hearthport", {
+    provider = ak_get_or_create("/providers/oauth2/", "name", "hearthport", provider_body := {
         "name": "hearthport", "authorization_flow": authz, "invalidation_flow": inval, "client_type": "confidential",
         "client_id": "hearthport-dev", "client_secret": "hearthport-dev-secret", "signing_key": key, "property_mappings": maps,
+        # Authentik 2026.8+ refuses every authorize request whose grant isn't listed; an API-created
+        # provider without this field gets an empty list.
+        "grant_types": ["authorization_code"],
         "redirect_uris": [{"matching_mode": "strict", "url": "http://localhost:8080/auth/oidc/callback"}]})
+    if provider.get("grant_types") != provider_body["grant_types"]:  # stacks seeded before this fix
+        must(ak("PATCH", f"/providers/oauth2/{provider['pk']}/", {"grant_types": provider_body["grant_types"]}), "grant types")
 
     apps = {  # slug: (name, provider, launch url, bound group)
         "hearthport": ("Hearthport", provider["pk"], "", "media-users"),

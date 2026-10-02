@@ -11,10 +11,13 @@ import (
 
 // AuthentikConfig holds the settings for the Authentik checks.
 type AuthentikConfig struct {
-	URL       string   // e.g. https://auth.example.com
-	Token     string   // service-account API token
-	AppSlug   string   // Hearthport's own application slug
-	TestUsers []string // usernames to list applications for
+	URL     string // e.g. https://auth.example.com
+	Token   string // service-account API token
+	AppSlug string // Hearthport's own application slug
+	// TestUsers are the users to list applications for: a username, or
+	// "name=pk" to skip the username lookup (as Hearthport does when the
+	// ID token carries an ak_pk claim, so the token needs no view_user).
+	TestUsers []string
 }
 
 type akApp struct {
@@ -82,8 +85,17 @@ func ProbeAuthentik(ctx context.Context, cfg AuthentikConfig, c *Client, r *Repo
 	if len(cfg.TestUsers) == 0 {
 		r.Add(svc, "per-user apps", Skip, "no test users given (HP_AUTHENTIK_TEST_USERS)")
 	}
-	unionVisible := map[string]int{}
-	for _, username := range cfg.TestUsers {
+	for _, entry := range cfg.TestUsers {
+		username, pkText, hasPK := strings.Cut(entry, "=")
+		if hasPK {
+			pk, err := strconv.Atoi(pkText)
+			if err != nil {
+				r.Add(svc, "user lookup", Fail, "%q: pk %q is not a number", username, pkText)
+				continue
+			}
+			akCheckUserApps(ctx, c, r, cfg, username, pk)
+			continue
+		}
 		var users akPage[akUser]
 		err := c.GetJSON(ctx, "/core/users/", url.Values{"username": {username}}, &users)
 		switch {
@@ -99,42 +111,47 @@ func ProbeAuthentik(ctx context.Context, cfg AuthentikConfig, c *Client, r *Repo
 		}
 		u := users.Results[0]
 		r.Add(svc, "user lookup", Pass, "%q has pk %d", username, u.PK)
-
-		apps, pages, emptyPages, err := akAppsForUser(ctx, c, u.PK)
-		if err != nil {
-			if strings.Contains(err.Error(), "User not found") {
-				r.Add(svc, "apps for user", Fail, "for_user=%d returned \"User not found\": the token needs authentik_core.view_user_applications", u.PK)
-			} else {
-				r.Add(svc, "apps for user", Fail, "%q: %v", username, err)
-			}
-			continue
-		}
-		slugs := make([]string, 0, len(apps))
-		hasSelf := false
-		noLaunch := 0
-		for _, a := range apps {
-			slugs = append(slugs, a.Slug)
-			unionVisible[a.Slug]++
-			if a.Slug == cfg.AppSlug {
-				hasSelf = true
-			}
-			if a.LaunchURL == "" {
-				noLaunch++
-			}
-		}
-		sort.Strings(slugs)
-		r.Add(svc, "apps for user", Pass, "%q can access %d apps (%d pages, %d empty pages, %d without a launch URL): %s",
-			username, len(apps), pages, emptyPages, noLaunch, strings.Join(slugs, ", "))
-		if cfg.AppSlug != "" {
-			if hasSelf {
-				r.Add(svc, "Hearthport access", Pass, "%q can access %q", username, cfg.AppSlug)
-			} else {
-				r.Add(svc, "Hearthport access", Info, "%q cannot access %q, so Hearthport would refuse them", username, cfg.AppSlug)
-			}
-		}
+		akCheckUserApps(ctx, c, r, cfg, username, u.PK)
 	}
 
-	akUnboundApps(ctx, c, r)
+	akUnboundApps(ctx, c, r, me.User.IsSuperuser)
+}
+
+// akCheckUserApps lists one user's applications and checks Hearthport's own slug is among them.
+func akCheckUserApps(ctx context.Context, c *Client, r *Report, cfg AuthentikConfig, username string, pk int) {
+	const svc = "Authentik"
+	apps, pages, emptyPages, err := akAppsForUser(ctx, c, pk)
+	if err != nil {
+		if strings.Contains(err.Error(), "User not found") {
+			r.Add(svc, "apps for user", Fail, "for_user=%d returned \"User not found\": the token needs authentik_core.view_user_applications", pk)
+		} else {
+			r.Add(svc, "apps for user", Fail, "%q: %v", username, err)
+		}
+		return
+	}
+	slugs := make([]string, 0, len(apps))
+	hasSelf := false
+	noLaunch := 0
+	for _, a := range apps {
+		slugs = append(slugs, a.Slug)
+		if a.Slug == cfg.AppSlug {
+			hasSelf = true
+		}
+		if a.LaunchURL == "" {
+			noLaunch++
+		}
+	}
+	sort.Strings(slugs)
+	r.Add(svc, "apps for user", Pass, "%q can access %d apps (%d pages, %d empty pages, %d without a launch URL): %s",
+		username, len(apps), pages, emptyPages, noLaunch, strings.Join(slugs, ", "))
+	if cfg.AppSlug == "" {
+		return
+	}
+	if hasSelf {
+		r.Add(svc, "Hearthport access", Pass, "%q can access %q", username, cfg.AppSlug)
+	} else {
+		r.Add(svc, "Hearthport access", Info, "%q cannot access %q, so Hearthport would refuse them", username, cfg.AppSlug)
+	}
 }
 
 // akAppsForUser follows every page. Authentik paginates before filtering by
@@ -159,7 +176,10 @@ func akAppsForUser(ctx context.Context, c *Client, pk int) (apps []akApp, pages,
 
 // akUnboundApps lists applications with no policy, group or user bindings.
 // Authentik lets every user open those (unless core_default_app_access is off).
-func akUnboundApps(ctx context.Context, c *Client, r *Report) {
+//
+// Only a superuser token sees every application; any other token sees the
+// apps its own account can open, so the result then covers those only.
+func akUnboundApps(ctx context.Context, c *Client, r *Report, superuser bool) {
 	const svc = "Authentik"
 	var all []akApp
 	page := 1
@@ -193,11 +213,17 @@ func akUnboundApps(ctx context.Context, c *Client, r *Report) {
 		r.Add(svc, "apps without bindings", Skip, "token can only see its own applications (superuser_full_list needs a superuser)")
 		return
 	}
+	scope := "apps"
+	if !superuser {
+		// A non-superuser token only sees apps its own account can open, and
+		// an unbound app is open to every account, so this still finds them all.
+		scope = "apps visible to this token"
+	}
 	if len(unbound) > 0 {
 		sort.Strings(unbound)
-		r.Add(svc, "apps without bindings", Warn, "%d of %d apps have no bindings, so every Authentik user can open them: %s",
-			len(unbound), len(all), strings.Join(unbound, ", "))
+		r.Add(svc, "apps without bindings", Warn, "%d of %d %s have no bindings, so every Authentik user can open them: %s",
+			len(unbound), len(all), scope, strings.Join(unbound, ", "))
 	} else {
-		r.Add(svc, "apps without bindings", Pass, "all %d apps have at least one binding", len(all))
+		r.Add(svc, "apps without bindings", Pass, "all %d %s have at least one binding", len(all), scope)
 	}
 }

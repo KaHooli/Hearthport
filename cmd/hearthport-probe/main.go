@@ -68,7 +68,7 @@ var envHelp = [][2]string{
 	{"HP_AUTHENTIK_URL", "e.g. https://auth.example.com"},
 	{"HP_AUTHENTIK_TOKEN", "service-account API token"},
 	{"HP_AUTHENTIK_APP_SLUG", "Hearthport's application slug (default hearthport)"},
-	{"HP_AUTHENTIK_TEST_USERS", "comma-separated usernames to check"},
+	{"HP_AUTHENTIK_TEST_USERS", "comma-separated usernames, or name=pk to skip the lookup"},
 	{"HP_SEERR_URL", "e.g. https://seerr.example.com"},
 	{"HP_SEERR_API_KEY", "Seerr API key (Settings → General)"},
 	{"HP_SEERR_TEST_EMAILS", "comma-separated user emails to match"},

@@ -119,6 +119,22 @@ Applied to [`docs/PLAN.md`](../PLAN.md) in the same change:
 - **Jellyfin moves to "later"**, because the target server runs Plex. Its design note stays in §5.3.
 - **SQLite stays the default**, and PostgreSQL is used when `HEARTHPORT_DATABASE_URL` is set. The owner's deployment will use their existing PostgreSQL 18 server, so CI tests the store against PostgreSQL 14 and 18.
 
+## Addendum (2026-10-02): automatic Authentik setup
+
+Prompted by [nextrmnl](https://github.com/DerKezorm/nextrmnl)'s "authentik button": a one-time API token lets the app create its own OIDC provider and application, and a blueprint is offered as the no-token alternative. Both were prototyped for Hearthport against Authentik 2026.8.3; the design is in PLAN §4.2.1–§4.2.4.
+
+- **`grant_types` is required on 2026.8.** A provider created through the API without it gets `grant_types: []`, and the authorize endpoint then redirects back with `error=invalid_request` for every sign-in. This was reproduced with the spike's own seed, which has now been fixed. Setting `["authorization_code"]` fixes it, and older Authentik versions ignore the field.
+- **One-button setup works.** The prototype covered the signing key, the `ak_pk` scope mapping, the provider, the application (icon set by URL through `meta_icon`), the group bindings, and the service account with an API token and role. A second run left client ID, secret and token unchanged.
+- **Real sign-in through the created provider.** It used the flow executor with the authorization-code flow and a token exchange, and the ID token contained:
+  - `sub`: the user's UUID (`sub_mode: user_uuid`)
+  - `ak_pk`: the user's pk (`5`), from the custom `hearthport` scope
+  - `groups`: from Authentik's managed `profile` scope; no extra mapping is needed
+  - `email_verified: false`: Authentik's managed email mapping since 2025.10. Hearthport doesn't rely on it.
+- **Access control.** A user in none of the bound groups (carol) got Authentik's "Permission denied" page and was never redirected to Hearthport's callback.
+- **Blueprint with preset secrets.** A blueprint can set a provider's `client_id` and `client_secret`, a token's `key`, a service-account user's `type` and `roles`, and a role's `permissions`. Importing it through `POST /api/v3/managed/blueprints/import/` succeeded. Signing in with the preset client secret then worked, and the preset token listed apps for a given user. So Hearthport can generate the secrets, write them into the blueprint and keep them, and nothing needs copying back after the import.
+- **Minimum discovery permissions confirmed again.** With `ak_pk` in the ID token, the discovery account needs only `authentik_core.view_user_applications`, plus `authentik_policies.view_policybinding` for the unbound-apps warning. The probe now accepts `name=pk` test users to check exactly this setup.
+- **Unbound-apps check without a superuser token.** A non-superuser token only lists apps its own account can open, but an app with no bindings is open to every account, so the check still finds all of them.
+
 ## Running the probe against your servers
 
 The probe only reads (HTTP GET), masks email addresses in its report, and never prints tokens. Run it on a machine that can reach your servers; it needs Go 1.24 or newer.
@@ -128,7 +144,7 @@ git clone https://github.com/KaHooli/Hearthport && cd Hearthport
 export HP_AUTHENTIK_URL=https://auth.example.com
 export HP_AUTHENTIK_TOKEN=…            # API-intent token of the Hearthport service account
 export HP_AUTHENTIK_APP_SLUG=hearthport  # if you've created the app already
-export HP_AUTHENTIK_TEST_USERS=you,a-family-member
+export HP_AUTHENTIK_TEST_USERS=you,a-family-member   # or name=pk to skip the lookup
 export HP_SEERR_URL=https://seerr.example.com HP_SEERR_API_KEY=… HP_SEERR_TEST_EMAILS=you@example.com
 export HP_PLEX_URL=http://plex.lan:32400 HP_PLEX_TOKEN=…   # owner's X-Plex-Token
 export HP_TAUTULLI_URL=http://tautulli.lan:8181 HP_TAUTULLI_API_KEY=…

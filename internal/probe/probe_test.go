@@ -182,3 +182,34 @@ func TestRedactEmails(t *testing.T) {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
+
+// With "name=pk" the probe skips the user lookup, as Hearthport does when the
+// ID token carries an ak_pk claim, so a token without view_user still works.
+func TestAuthentikUserPKSkipsLookup(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/core/users/me/":
+			fmt.Fprint(w, `{"user":{"pk":9,"username":"sa"}}`)
+		case "/core/users/":
+			t.Error("looked up a user although its pk was given")
+			http.Error(w, "forbidden", http.StatusForbidden)
+		case "/core/applications/":
+			if req.URL.Query().Get("for_user") != "5" {
+				fmt.Fprint(w, `{"pagination":{"next":0},"results":[]}`)
+				return
+			}
+			fmt.Fprint(w, `{"pagination":{"next":0},"results":[{"slug":"hearthport","launch_url":"http://h"}]}`)
+		default:
+			http.Error(w, "forbidden", http.StatusForbidden)
+		}
+	}))
+	defer srv.Close()
+	r := &Report{}
+	ProbeAuthentik(context.Background(), AuthentikConfig{AppSlug: "hearthport", TestUsers: []string{"alice=5", "bad=x"}}, NewClient(srv.URL, nil, defaultTimeout), r)
+	if got := find(r, "Hearthport access"); len(got) != 1 || got[0].Level != Pass {
+		t.Fatalf("expected alice to pass via pk 5, got %+v", got)
+	}
+	if got := find(r, "user lookup"); len(got) != 1 || got[0].Level != Fail || !strings.Contains(got[0].Detail, "not a number") {
+		t.Fatalf("expected a FAIL for the non-numeric pk, got %+v", got)
+	}
+}
