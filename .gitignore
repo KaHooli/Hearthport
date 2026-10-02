@@ -8,3 +8,7 @@
 .env
 *.env.sh
 probe-report*.md
+
+# Python bytecode
+__pycache__/
+*.pyc
