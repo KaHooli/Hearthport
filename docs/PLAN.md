@@ -16,7 +16,7 @@
 | G10 | Admins can share extra links in the portal | Services can also be custom links, shown to all signed-in users or only to chosen Authentik groups (§5.1) |
 | G11 | Optionally use an external PostgreSQL server | Built-in SQLite by default; set `HEARTHPORT_DATABASE_URL` to use PostgreSQL instead (§7.1) |
 | G12 | An easy overview of each user's services and how to use them | A dashboard home page and a left-hand category menu (TV, Movies, Books, Comics, …). Each category page shows how to **request** (e.g. Seerr) and how to **consume** (e.g. Plex), with instructions and app download links (§5.1, §5.2) |
-| G13 | Live information from the services themselves | Integrations: status checks for every service, plus Seerr requests and Jellyfin/Plex recently added (§5.3) |
+| G13 | Live information from the services themselves | Integrations: status checks for every service, plus Seerr requests and Plex recently added (§5.3) |
 
 ### Non-goals (v1)
 - Acting as a reverse proxy or forward-auth provider (Authentik's outposts already do this).
@@ -84,7 +84,7 @@ The artwork in [`assets/`](../assets/README.md) is the **default branding**. Adm
             │  Key: HEARTHPORT_SECRET_KEY or /data/secret.key                   │
             └──────┬─────────────────────────────┬─────────────────┬────────────┘
                    │ OIDC (discovery, token,     │ REST API        │ Integrations (server-side only)
-                   │ JWKS, end-session)          │ applications    │ status checks, Seerr, Jellyfin, Plex
+                   │ JWKS, end-session)          │ applications    │ status checks, Seerr, Plex
                    ▼                             ▼                 ▼
             ┌──────────────────── Authentik ─────────────┐   ┌──── Your services ────┐
             └────────────────────────────────────────────┘   └───────────────────────┘
@@ -149,15 +149,74 @@ The OIDC config has three states: **none → draft → confirmed**.
 | `draft` | Saved but not yet proven to work | Local login only (+ "Test OIDC" button for admins) |
 | `confirmed` | An admin completed a successful test login | **OIDC only** (unless the §4.3 override is set) |
 
-Admin → Authentication page fields:
+Admin → Authentication offers three ways to create the draft. All three end in the same draft and the same *Test & confirm* step below. The approach follows [nextrmnl](https://github.com/DerKezorm/nextrmnl)'s Authentik button.
+
+#### 4.2.1 "Set up with Authentik" (recommended)
+
+The admin enters two things:
+- the **Authentik address**
+- a **one-time API token** from an Authentik superuser (e.g. a token with a 1-hour expiry, deleted afterwards)
+
+They can also enter:
+- their own Authentik **username**, to be added to the admin group so they can't lock themselves out
+- which existing Authentik **groups** may use Hearthport (default: create `hearthport-users`)
+
+Hearthport then makes, through the Authentik API, everything an admin would otherwise click together in a dozen forms. Each step is shown as it runs with ✓ or ✗ and Authentik's HTTP status; the first failure stops the run.
+
+| # | Step | What Hearthport does |
+|---|---|---|
+| 1 | Reach | `GET /admin/version/`; shows the version and warns if it's older than the oldest tested |
+| 2 | Signing key | Finds or generates the certificate `hearthport` (`/crypto/certificatekeypairs/generate/`, RSA, 10 years) |
+| 3 | Scope mapping | Finds or creates `Hearthport: ak_pk` (scope `hearthport`, `return {"ak_pk": request.user.pk}`) and looks up Authentik's managed `openid`, `profile` and `email` mappings. `profile` already includes the `groups` claim |
+| 4 | Provider | Finds or creates OAuth2 provider `hearthport` (§4.2.4) |
+| 5 | Application | Finds or creates application `hearthport`: launch URL `{BASE_URL}/`, description "Your apps, all in one place", icon `{BASE_URL}/static/brand/icon-192.png` |
+| 6 | Groups and access | Finds or creates `hearthport-users` (or uses the chosen groups) and `hearthport-admins`, binds both to the application, and adds the given username to `hearthport-admins`. **The application is never left without bindings**, because Authentik would then open it to every user (§4.5) |
+| 7 | Discovery account | Finds or creates service account `hearthport-discovery`, an **API-intent** token for it, and role `hearthport-discovery` with `authentik_core.view_user_applications` and `authentik_policies.view_policybinding` (§5) |
+| 8 | Fill in | Stores issuer, client ID and secret, the discovery token (encrypted), the app slug and the admin group as a **draft**, then confirms the issuer with one discovery call |
+
+**Rules for the setup run**
+- **The one-time token** is used for these calls only. It is never stored or logged, and error messages show Authentik's status code and content type, never the token.
+- **Error responses aren't echoed to the browser.** The address comes from the admin and could point at any service, so the response body goes to the server log only.
+- **Running it again is safe:** each object is found by its exact name or slug and updated in place (`PATCH`). Client ID, secret and tokens are kept, and a changed `{BASE_URL}` updates the redirect URI.
+- **Partial runs are kept:** steps that succeeded before a failure stay in Authentik, and the next run picks them up.
+- **Confirmation is still required.** The admin must still run *Test & confirm*; the setup run never switches login methods on its own.
+
+Tested on Authentik 2026.8.3 (docs/spike/phase0.md, addendum): a real sign-in through the created provider returned `ak_pk`, `groups` and a UUID `sub`. A user outside the bound groups got Authentik's "Permission denied" page and never reached the callback. Running the setup twice changed nothing.
+
+#### 4.2.2 Blueprint download (no token handed over)
+
+For admins who would rather not give Hearthport a superuser token, Hearthport offers a **blueprint** (`hearthport-authentik.yaml`) that creates the same objects.
+- **Generated secrets:** Hearthport generates the client ID, client secret and discovery-token key itself, writes them into the blueprint, and stores them in the draft at the same moment. After the admin imports the file, nothing needs copying back.
+- **Importing:** under *Customization → Blueprints*, or by dropping the file into the worker's `blueprints/custom/` folder.
+- **Contents:** the groups, the `ak_pk` scope mapping, the provider (with the preset `client_id` and `client_secret`), the application, two group bindings, the role with its permissions, the service account (`type: service_account`, `roles: [role]`) and its API token (`key:` preset).
+- **Signing key:** Authentik's default self-signed certificate, because a blueprint can't generate one.
+- **The file contains secrets.** It is downloaded once, shown with a warning to delete it after importing, and never kept by Hearthport.
+- **Tested:** imported through `POST /api/v3/managed/blueprints/import/` on Authentik 2026.8.3. Signing in with the preset client secret worked, and the preset token listed apps for a given user.
+
+#### 4.2.3 Manual setup
+
+The original form, for other setups or for admins who prefer to do it by hand. Admin → Authentication page fields:
 - Issuer URL (e.g. `https://auth.example.com/application/o/hearthport/`), fetched via `.well-known/openid-configuration`
 - Client ID, client secret (encrypted at rest)
-- Scopes (default `openid profile email groups`; see §5)
+- Scopes (default `openid profile email hearthport`). Authentik's `profile` scope carries `groups`, and `hearthport` carries `ak_pk` when that mapping exists (see §5)
 - Claim mappings: username (`preferred_username`), display name (`name`), email, groups (`groups`)
 - **Admin group(s)**: Authentik group names whose members become Hearthport admins (e.g. `hearthport-admins`)
 - Authentik API settings for app discovery (§5): base URL, service-account API token (encrypted)
 - Hearthport's application slug in Authentik (default `hearthport`), used for the access check in §4.5
 - Read-only: the redirect URI to paste into Authentik (`{BASE_URL}/auth/oidc/callback`)
+- A link to `docs/authentik-setup.md`, which walks through the same objects as §4.2.1 by hand
+
+#### 4.2.4 Provider settings (all three ways)
+
+- **Client type:** `confidential`.
+- **`grant_types: [authorization_code]`.** Since Authentik 2026.8, a provider created through the API without `grant_types` gets an empty list, and every sign-in is refused with `invalid_request`. This was reproduced in Phase 0. Hearthport keeps no refresh tokens, so it needs no other grant.
+- **Redirect URI:** `{BASE_URL}/auth/oidc/callback`, strict matching.
+- **Flows:** `default-provider-authorization-implicit-consent`, falling back to the first authorization flow, and `default-provider-invalidation-flow`.
+- **`sub_mode: user_uuid`**, a stable ID that the users API can also filter by.
+- **`include_claims_in_id_token: true`.**
+- **Property mappings:** managed `openid`, `profile` and `email`, plus `Hearthport: ak_pk`.
+- **`email_verified` is ignored:** Authentik's managed email mapping returns `false` since 2025.10. Hearthport identifies users by `sub`, not email, so this doesn't matter; email is used only for matching to Seerr or Plex.
+
 
 **Test & confirm flow** (stops admins locking themselves out):
 1. The admin clicks *Test & confirm*. Hearthport runs discovery and shows any errors inline.
@@ -200,6 +259,7 @@ Any Authentik user whose access to the Hearthport application is allowed in Auth
 
 - **Main gate, in Authentik:** the admin binds users, groups or policies to the Hearthport application in Authentik. Authentik refuses the authorization request for anyone else, so they never reach Hearthport's callback.
 - **Second check, in Hearthport:** at the OIDC callback, Hearthport fetches the user's permitted applications (§5). If the Hearthport application slug is not in the list, it shows a "you don't have access" page and creates no session. This catches mistakes such as the Hearthport application having no bindings at all, which Authentik treats as "allow everyone".
+- **Warning about open apps:** Authentik lets every user open an app with no bindings (its `core_default_app_access` flag, on by default). If the service account can read bindings, the admin status page lists such apps, so they aren't exposed to everyone by accident.
 - **Revocation:** on each app-list refresh (cache TTL, §5), if Hearthport's own slug has disappeared from the user's list, the session is ended and the user is sent to `/login`.
 - `admin` vs `user` role is decided separately by the admin group(s) (§4.4). Access to Hearthport doesn't depend on group names configured in Hearthport.
 
@@ -211,16 +271,25 @@ application's policy/group/user bindings. Its own *My applications* page uses
 user can access. Hearthport reuses that decision instead of copying policies.
 
 **Decision: service-account token.**
-- The admin creates an Authentik service account and an API token for it, with permission to view applications and users (minimum permissions to be confirmed in the Phase 0 spike).
-- Hearthport calls `GET /api/v3/core/applications/?for_user=<pk>&page_size=100` (following pagination), where `<pk>` is the Authentik user ID.
-- The user's `pk` is found by `GET /api/v3/core/users/?username=<preferred_username>` at login and stored in the session. If a custom `ak_user_pk` claim is added via an Authentik scope mapping, it is used instead.
+- The admin creates an Authentik service account, then an **API-intent token** for it under *Directory → Tokens and App passwords*. The token shown when the service account is created is an app password, which the API rejects.
+- The service account gets a role (e.g. `hearthport-discovery`) with these permissions:
+  - **`authentik_core.view_user_applications`**, required for `for_user`. Without it Authentik answers `400 "User not found"`; Hearthport's setup check explains this.
+  - **`authentik_core.view_user`**, only needed if the user's pk comes from a username lookup (see below).
+  - Optionally **`authentik_policies.view_policybinding`**, so Hearthport can warn about apps with no bindings (§4.5).
+- Hearthport calls `GET /api/v3/core/applications/?for_user=<pk>&page_size=100`, where `<pk>` is the Authentik user ID. Authentik pages the list **before** filtering it per user, so a page can be short or empty while more follow. Hearthport follows `pagination.next` until it is 0 and ignores `count`, which is the total of all apps.
+- **Finding the user's pk:** setup (§4.2.1, §4.2.2) creates a scope mapping that adds an `ak_pk` claim (`return {"ak_pk": request.user.pk}`), so no user lookup and no `view_user` permission is needed. This was confirmed with a real sign-in. If the claim is missing (manual setup without the mapping), Hearthport looks the pk up with `GET /api/v3/core/users/?username=<preferred_username>` at login, which needs `view_user`. Either way the pk is stored in the session.
+- **Never use `check_access`:** `/core/applications/<slug>/check_access/` only honours `for_user` for superuser tokens. For any other token it silently checks the token's own account.
 - User tokens never get API access, and the behaviour is the same for every user.
 - Not planned for v1: using the user's own token (via Authentik's `goauthentik.io/api` scope). It would give the portal API access as each user, which is too powerful for Authentik admins.
 
-> **Spike (Phase 0):** confirm, against the target Authentik version, that `for_user` gives the same results as the user's own library view (including `superuser_full_list` behaviour for Authentik superusers), and the minimum permissions the service account needs.
+> **Phase 0 result:** confirmed on Authentik 2026.8.3. `for_user` matches each user's group bindings exactly. See [docs/spike/phase0.md](spike/phase0.md).
 
 Handling the results:
-- Fields used: `name`, `slug`, `group`, `meta_launch_url` (falls back to the provider's launch URL), `meta_icon`, `meta_description`, `meta_publisher`, `open_in_new_tab`.
+- Fields used:
+  - `name`, `slug`, `group`, `meta_description`, `meta_publisher`, `open_in_new_tab`
+  - `launch_url`: already resolved from `meta_launch_url` or the provider; empty when there isn't one
+  - `meta_icon_url`, and `meta_icon_themed_urls` for light and dark icons
+  - `meta_hide`: an app the admin hid in Authentik isn't shown
 - Apps with no launch URL are skipped. The Hearthport app itself is hidden, but its presence is used for the access check (§4.5).
 - Icons: relative `meta_icon` paths are resolved against the Authentik base URL. Optionally Hearthport proxies and caches icons so the browser never calls Authentik's API directly.
 - **Cache**: per-user, in memory, TTL 60s (configurable), cleared on login. A "refresh" button bypasses it.
@@ -237,7 +306,7 @@ Category: Books                     (left menu item)
  └─ Section: Listen         [consume]   → Audiobookshelf
 Category: TV
  ├─ Section: Request        [request]   → Seerr        "Search for the show, then Request"
- └─ Section: Watch          [consume]   → Plex, Jellyfin
+ └─ Section: Watch          [consume]   → Plex
 ```
 
 **Service**: one entry per thing a user can use (Plex, Seerr, Kavita, a wiki, …).
@@ -315,7 +384,7 @@ Category: TV
   - **Get the app** buttons, one per platform link
   - an expandable **How to use** panel with the Markdown instructions
   - a ☆ button to add or remove it from favourites
-  - integration widgets where configured, e.g. "Recently added to TV" from Plex or Jellyfin
+  - integration widgets where configured, e.g. "Recently added to TV" from Plex
 
 **Dashboard** (`/`, the home page after login), top to bottom:
 1. **Getting started guide**: admin-written Markdown for new users, e.g. accepting invites and installing apps. Each user can dismiss it. When the admin publishes a new version, it's shown again to everyone.
@@ -324,7 +393,7 @@ Category: TV
    - Each can be targeted at all users or only at selected Authentik groups.
 3. **Favourites**: the services this user has starred, as compact one-click launch tiles. If empty, it explains how to star a service.
 4. **Your services**: one overview card per category the user can access. Each card shows the category's sections with their services' icons, a quick **Request** button (the first request service) and an **Open** button (the first consume service), and links to the category page.
-5. **Live widgets** (§5.3): "Your requests" (Seerr), "Recently added" (Jellyfin/Plex), and a service status summary.
+5. **Live widgets** (§5.3): "Your requests" (Seerr), "Recently added" (Plex), and a service status summary.
 
 **Per-user data**: favourites and the dismissed guide version are stored against the user's Authentik `sub` in a small `users` table. This is created on first login and holds no passwords.
 
@@ -351,19 +420,28 @@ Integrations add live information from the services themselves.
 
 **Seerr (Overseerr / Jellyseerr / Seerr)**
 - The user is matched to a Seerr user by email (default) or username. The match is cached.
+  - Seerr's `?q=` search is a substring search, so only an **exact, case-insensitive** match counts. Zero or several matches mean "not linked".
+  - Users Seerr imported from Jellyfin have their username as their email until they set one, so username matching is the fallback for them.
+- Every call for a user sends the API key **and `X-API-User: <seerr id>`**. Seerr then acts as that user and refuses to return anyone else's requests, even if Hearthport has a bug.
+- Request results contain only TMDB IDs. Titles and posters come from Seerr's `/movie/{id}` and `/tv/{id}`, cached for a day. A request still shows if that lookup fails.
 - **"Your requests" widget**: the user's recent requests with their title, poster and status (pending, approved, available, declined), each linking to the item in Seerr.
 - Only the matched user's own requests are shown. If there's no match, the widget explains that the user needs to sign in to Seerr first.
 
-**Jellyfin**
-- The user is matched to a Jellyfin user by username (default) or email.
-- **"Recently added" widget**: calls `/Users/{id}/Items/Latest` as that Jellyfin user, so results respect the user's library access in Jellyfin.
-- The admin maps Jellyfin libraries to Hearthport categories, so TV pages show TV additions and so on.
-
 **Plex**
 - **"Recently added" widget** per library section, using the Plex server token. The admin maps Plex library sections to Hearthport categories.
-- Limitation: Plex's server API doesn't cheaply tell us which libraries are shared with each user. Each mapped section therefore has its own visibility setting: all users, or selected Authentik groups. The admin must set this to match their Plex sharing.
+- **Per-user library access:** the Plex server API doesn't say which libraries are shared with each user. Two other sources do, and Hearthport uses the first that works:
+  1. plex.tv `GET /api/servers/<machineIdentifier>/shared_servers` with the owner's token: one `SharedServer` per user with `Section shared="1"` entries. Each user's access token in that response is ignored and never stored.
+  2. Tautulli `cmd=get_users`, which returns `shared_libraries` for each user. This needs a Tautulli integration.
 
-**Later (v1.x)**: Audiobookshelf, Kavita, Komga and Tautulli, built on the same interface.
+  The Hearthport user is matched to the Plex user by email or username.
+- **Fallback:** if neither source works, each mapped section has its own visibility setting (all users or selected Authentik groups), which the admin sets to match their Plex sharing.
+- Both sources still need confirming on a real claimed server; the probe tool checks them (docs/spike/phase0.md).
+
+**Later (v1.x)**: Jellyfin, Audiobookshelf, Kavita, Komga and Tautulli, built on the same interface.
+- **Jellyfin design note** (from Phase 0, confirmed on Jellyfin 12.1.0):
+  - Match users by username, with email as an alternative.
+  - `GET /Items/Latest?userId=<id>` with a single API key returns only items from libraries that user can access.
+  - The admin maps Jellyfin libraries to categories.
 
 **Safety**
 - Only admins can set integration URLs.
@@ -611,6 +689,8 @@ Multi-arch images (`linux/amd64`, `linux/arm64`) are published to GHCR by a GitH
 
 ```
 cmd/hearthport/           main.go (serve, reset-admin-password, healthcheck subcommands)
+cmd/hearthport-probe/     read-only API checks against real servers (Phase 0)
+internal/probe/           checks used by hearthport-probe, with unit tests
 internal/config/          env parsing
 internal/store/           Store interface + shared contract tests
 internal/store/sqlite/    SQLite implementation, queries, migrations
@@ -621,33 +701,39 @@ internal/authentik/       API client, app discovery (service-account token), cac
 internal/catalog/         services, categories, sections, placements, per-user view building, starter template
 internal/dashboard/       guide, announcements, favourites
 internal/integrations/    Integration interface, registry, cache, image proxy
-  status/ seerr/ jellyfin/ plex/   one package per integration type
+  status/ seerr/ plex/      one package per integration type
 internal/web/             router, handlers, middleware, templates/, static/
 assets/                   brand artwork source (SVG + generated PNG/ICO); copied into
                           internal/web/static/brand/ at build time and embedded with go:embed
 docs/                     PLAN.md, authentik-setup.md
 deploy/                   docker-compose.yml examples
+deploy/dev/               throwaway test stack (compose.spike.yml) and seed.py
 Dockerfile, Makefile, .github/workflows/
 ```
 
 ## 12. Roadmap
 
-**Phase 0: Spike (short)**
-- Stand up Authentik in docker-compose for development. Create an OAuth2/OpenID provider + application and a few test apps with group bindings.
-- Verify app discovery via `for_user` with a service-account token, including that Hearthport's own slug appears only for users bound to it. Write down the minimum service-account permissions and the claims actually needed.
-- Check the integration APIs against real instances: Seerr user lookup by email and requests by user, Jellyfin user lookup and `Items/Latest`, and Plex library sections and recently added. Record the API versions tested.
+**Phase 0: Spike (done, 2026-10-01; see [docs/spike/phase0.md](spike/phase0.md))**
+- A throwaway stack (`deploy/dev/compose.spike.yml`) with Authentik 2026.8, Seerr 3.5, Jellyfin 12.1 and Plex 1.43, seeded by `deploy/dev/seed.py`.
+- Confirmed: `for_user` app discovery and the minimum service-account permissions; Seerr per-user requests with `X-API-User`; Jellyfin per-user recently added; Plex sections and recently added.
+- A read-only probe tool (`cmd/hearthport-probe`) for checking real servers.
+- **Still to confirm on the real network** (blocked from the build sandbox):
+  - Seerr title lookups (TMDB)
+  - the `seerrng` fork's API
+  - Plex per-user sharing via plex.tv and Tautulli
 
 **Phase 1: Skeleton & bootstrap**
 - Go module, config, structured logging, `/healthz` and `/readyz`.
 - Store interface with SQLite and PostgreSQL implementations and migrations; startup retry, advisory lock and secret-key check (§7.1).
 - Bootstrap admin: password regenerated and printed on every boot until changed, forced password change on first login, local login, sessions, CSRF, logout.
 - Base layout/templates, login page with static branding.
-- Dockerfile and compose files (SQLite and PostgreSQL); CI (lint with `golangci-lint`, `go test`, image build). Store tests run against both SQLite and a PostgreSQL service container.
+- Dockerfile and compose files (SQLite and PostgreSQL); CI (lint with `golangci-lint`, `go test`, image build). Store tests run against SQLite and against PostgreSQL 14 (oldest supported) and 18 (the project owner's deployment) as service containers.
 
 **Phase 2: Admin & OIDC**
 - Admin area; branding editor (title, logo, Markdown message sanitized with `bluemonday`).
 - OIDC config draft/test/confirm lifecycle; encrypted secrets.
 - Login-method policy + `HEARTHPORT_ENABLE_LOCAL_LOGIN` override; RP-initiated logout.
+- "Set up with Authentik" (one-time token) and blueprint download (§4.2.1, §4.2.2), tested against the throwaway Authentik in CI.
 - Admin role mapping from groups.
 
 **Phase 3: App discovery, catalog & portal UI**
@@ -660,19 +746,19 @@ Dockerfile, Makefile, .github/workflows/
 **Phase 4: Integrations**
 - Integration framework: interface, admin settings with test connection, encrypted keys, cache, htmx widgets, image proxy (§5.3).
 - Status checks for all services.
-- Seerr "Your requests", Jellyfin "Recently added", Plex "Recently added" with library-to-category mapping and visibility.
+- Seerr "Your requests", and Plex "Recently added" with library-to-category mapping and per-user library access (plex.tv or Tautulli, with group visibility as the fallback).
 
 **Phase 5: Hardening & release**
 - Security headers, rate limiting, audit log view, reset-password CLI, `backup` (SQLite) and `migrate-db` (SQLite → PostgreSQL) CLIs.
 - Tests:
   - unit tests (login-method policy, claim mapping, crypto, catalog visibility rules)
-  - integration tests with a mock OIDC provider and mock Seerr/Jellyfin/Plex servers
+  - integration tests with a mock OIDC provider and mock Seerr and Plex servers
   - an end-to-end test (Playwright) against a real Authentik container in CI
-- `docs/authentik-setup.md` (step-by-step provider, scope mapping, service account), `docs/integrations.md`, multi-arch release to GHCR, v1.0.0.
+- `docs/authentik-setup.md` (step-by-step provider, `ak_pk` scope mapping, service account with an API-intent token and the `hearthport-discovery` role), `docs/integrations.md`, multi-arch release to GHCR, v1.0.0.
 
 **Later (v1.1+)**
 - Progressive Web App: manifest, service worker, offline page, install prompt (§5.4). Later, optional push notifications.
-- More integrations: Audiobookshelf, Kavita, Komga, Tautulli.
+- More integrations: Jellyfin, Audiobookshelf, Kavita, Komga, Tautulli.
 - Back-channel logout, Prometheus `/metrics`, i18n.
 
 ## 13. Acceptance criteria (v1)
@@ -691,7 +777,7 @@ Dockerfile, Makefile, .github/workflows/
 13. A service placed in two categories (e.g. Plex in TV and Movies) appears in both. A Books category with Request, Read eBooks and Listen sections shows all three, in order, each with its services, instructions and app links.
 14. An Authentik app the user can access that isn't placed anywhere appears under "Other". "Other" is hidden when empty.
 15. The getting-started guide stays dismissed after the user dismisses it, and reappears when the admin publishes a new version. Announcements appear and expire on their dates and respect group targeting. Favourites persist across sessions.
-16. The Seerr widget shows only the signed-in user's own requests. The Jellyfin widget only shows items from libraries that user can access. A Plex section limited to a group isn't shown to others.
+16. The Seerr widget shows only the signed-in user's own requests. A Plex library not shared with a user (according to plex.tv or Tautulli, or the group fallback) isn't shown to them.
 17. No integration API key or token appears in any HTML, JavaScript, network response to the browser or log line.
 18. When a service is down, its status dot turns red and its widgets show "unavailable", and the dashboard and category pages still load promptly.
 19. With `HEARTHPORT_DATABASE_URL` unset, Hearthport uses SQLite. With it set, Hearthport uses PostgreSQL, and every other criterion passes on both.
@@ -707,11 +793,13 @@ Dockerfile, Makefile, .github/workflows/
 | 3 | Who can sign in | Any user Authentik permits to access the Hearthport application (§4.5) |
 | 4 | Force bootstrap admin password change | Yes, on first login; password regenerated every boot until changed (§4.1) |
 | 5 | Extra non-Authentik links | Yes, admin-managed custom links with optional group visibility (§5.1) |
-| 6 | Database | SQLite by default; external PostgreSQL optional via `HEARTHPORT_DATABASE_URL` (§7.1) |
+| 6 | Database | SQLite by default; external PostgreSQL optional via `HEARTHPORT_DATABASE_URL` (§7.1). The project owner's own deployment uses PostgreSQL 18. |
 | 7 | Portal structure | Dashboard home and a left category menu. Categories contain admin-defined sections (typed request / consume / other); a service can appear in many categories (§5.1, §5.2) |
 | 8 | Apps not placed in a category | Shown under an automatic "Other" category (§5.1) |
 | 9 | Dashboard content | Getting-started guide, announcements, favourites, category overview cards, live widgets (§5.2) |
-| 10 | Live data | In v1: status checks, Seerr, Jellyfin, Plex. Audiobookshelf, Kavita, Komga, Tautulli later (§5.3) |
+| 10 | Live data | In v1: status checks, Seerr, Plex. Jellyfin, Audiobookshelf, Kavita, Komga and Tautulli later (§5.3) |
 | 11 | Installable app | PWA in a later update (v1.1); v1 lays the groundwork (§5.4) |
+| 12 | Jellyfin | Moved to later; the target server runs Plex. The Phase 0 findings are kept in §5.3 (2026-10-02) |
+| 13 | Authentik setup | One-button setup with a one-time token, or a generated blueprint, following nextrmnl; manual setup stays available (§4.2.1–§4.2.3) |
 
 No open questions remain. Anything new that comes up in the Phase 0 spike will be added here.

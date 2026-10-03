@@ -1,0 +1,64 @@
+# Throwaway stack for the Phase 0 spike and, later, integration tests.
+# Not for production: fixed dev secrets, no TLS, no persistence guarantees.
+#
+#   docker compose -f deploy/dev/compose.spike.yml up -d
+#   python3 deploy/dev/seed.py > /tmp/hp-env.sh && . /tmp/hp-env.sh   # test data
+#   go run ./cmd/hearthport-probe                                     # read-only checks
+#
+# Images come from Docker Hub (authentik/server, seerr/seerr) so the stack also
+# works where ghcr.io downloads are blocked.
+name: hearthport-spike
+
+x-authentik-env: &authentik-env
+  AUTHENTIK_SECRET_KEY: dev-only-secret-key-not-for-production-0123456789
+  AUTHENTIK_POSTGRESQL__HOST: postgres
+  AUTHENTIK_POSTGRESQL__USER: authentik
+  AUTHENTIK_POSTGRESQL__NAME: authentik
+  AUTHENTIK_POSTGRESQL__PASSWORD: authentik
+  AUTHENTIK_BOOTSTRAP_PASSWORD: akadmin-dev-password
+  AUTHENTIK_BOOTSTRAP_TOKEN: dev-bootstrap-token-0123456789abcdef
+  AUTHENTIK_BOOTSTRAP_EMAIL: akadmin@example.test
+  AUTHENTIK_DISABLE_UPDATE_CHECK: "true"
+  AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+  AUTHENTIK_DISABLE_STARTUP_ANALYTICS: "true"
+  # IPv4-only listeners: the default [::] bind fails on hosts without IPv6.
+  AUTHENTIK_LISTEN__HTTP: 0.0.0.0:9000
+  AUTHENTIK_LISTEN__HTTPS: 0.0.0.0:9443
+  AUTHENTIK_LISTEN__METRICS: 0.0.0.0:9300
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: authentik
+      POSTGRES_PASSWORD: authentik
+      POSTGRES_DB: authentik
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U authentik"]
+      interval: 5s
+      retries: 20
+
+  authentik:
+    image: authentik/server:2026.8
+    command: server
+    environment: *authentik-env
+    ports: ["9000:9000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  authentik-worker:
+    image: authentik/server:2026.8
+    command: worker
+    environment: *authentik-env
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    ports: ["8096:8096"]
+
+  seerr:
+    image: seerr/seerr:latest
+    environment:
+      LOG_LEVEL: info
+    ports: ["5055:5055"]
