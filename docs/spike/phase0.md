@@ -148,10 +148,14 @@ export HP_AUTHENTIK_TEST_USERS=you,a-family-member   # or name=pk to skip the lo
 export HP_SEERR_URL=https://seerr.example.com HP_SEERR_API_KEY=… HP_SEERR_TEST_EMAILS=you@example.com
 export HP_PLEX_URL=http://plex.lan:32400 HP_PLEX_TOKEN=…   # owner's X-Plex-Token
 export HP_TAUTULLI_URL=http://tautulli.lan:8181 HP_TAUTULLI_API_KEY=…
+export HP_SONARR_URL=http://sonarr.lan:8989 HP_SONARR_API_KEY=…   # calendar plugins (PLAN.md §5.5)
+export HP_RADARR_URL=http://radarr.lan:7878 HP_RADARR_API_KEY=…
 go run ./cmd/hearthport-probe > probe-report.md
 ```
 
-Leave any service's URL unset to skip it. Check the report before sharing it. Titles in "recently added" are shown as-is, and usernames appear in the Plex sharing line.
+Leave any service's URL unset to skip it. Check the report before sharing it. Titles in "recently added" and in the Sonarr and Radarr example events are shown as-is, root folder paths and tag names are listed, and usernames appear in the Plex sharing line.
+
+The Sonarr and Radarr checks read each calendar from 7 days ago to `HP_CALENDAR_DAYS` ahead (default 30), monitored items only. They confirm the fields the calendar plugins need (Sonarr: `airDateUtc` and the series with its runtime; Radarr: the cinema, digital and physical release dates), and that each item falls under a root folder so it can be mapped to a category.
 
 ## Reproducing the throwaway stack
 

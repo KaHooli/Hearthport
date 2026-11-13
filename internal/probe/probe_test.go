@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func find(r *Report, check string) []Result {
@@ -211,5 +212,131 @@ func TestAuthentikUserPKSkipsLookup(t *testing.T) {
 	}
 	if got := find(r, "user lookup"); len(got) != 1 || got[0].Level != Fail || !strings.Contains(got[0].Detail, "not a number") {
 		t.Fatalf("expected a FAIL for the non-numeric pk, got %+v", got)
+	}
+}
+
+func arrServer(t *testing.T, calendar string, check func(*http.Request)) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet {
+			t.Errorf("probe sent %s; it must only send GET", req.Method)
+		}
+		if req.Header.Get("X-Api-Key") != "arr-key" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		switch req.URL.Path {
+		case "/api/v3/system/status":
+			fmt.Fprint(w, `{"appName":"Arr","version":"4.0.0"}`)
+		case "/api/v3/rootfolder":
+			fmt.Fprint(w, `[{"path":"/media/tv"},{"path":"/media/anime"}]`)
+		case "/api/v3/tag":
+			fmt.Fprint(w, `[{"id":1,"label":"kids"}]`)
+		case "/api/v3/calendar":
+			if check != nil {
+				check(req)
+			}
+			fmt.Fprint(w, calendar)
+		default:
+			http.NotFound(w, req)
+		}
+	}))
+}
+
+// Sonarr's calendar must be read with includeSeries=true and without
+// unmonitored items, and each episode needs an air time and its series.
+func TestSonarrCalendar(t *testing.T) {
+	air := time.Now().UTC().Add(48 * time.Hour).Format(time.RFC3339)
+	cal := `[{"id":1,"seasonNumber":2,"episodeNumber":5,"title":"Pilot","airDateUtc":"` + air + `","hasFile":false,
+		"series":{"title":"Show","runtime":45,"path":"/media/tv/Show","tags":[1]}},
+		{"id":2,"seasonNumber":1,"episodeNumber":1,"title":"Other","airDateUtc":"` + air + `","hasFile":true,
+		"series":{"title":"Elsewhere","runtime":24,"path":"/srv/other/Elsewhere"}}]`
+	srv := arrServer(t, cal, func(req *http.Request) {
+		q := req.URL.Query()
+		if q.Get("includeSeries") != "true" || q.Get("unmonitored") != "false" || q.Get("start") == "" || q.Get("end") == "" {
+			t.Errorf("unexpected calendar query %q", req.URL.RawQuery)
+		}
+	})
+	defer srv.Close()
+	r := &Report{}
+	ProbeSonarr(context.Background(), ArrConfig{URL: srv.URL, APIKey: "arr-key"}, r)
+
+	if got := find(r, "calendar"); len(got) != 1 || got[0].Level != Pass || !strings.Contains(got[0].Detail, "2 episodes") || !strings.Contains(got[0].Detail, "1 downloaded") {
+		t.Fatalf("calendar: %+v", got)
+	}
+	if got := find(r, "event fields"); len(got) != 1 || got[0].Level != Pass {
+		t.Fatalf("event fields: %+v", got)
+	}
+	if got := find(r, "root folder mapping"); len(got) != 1 || got[0].Level != Warn || !strings.HasPrefix(got[0].Detail, "1 of 2") {
+		t.Fatalf("root folder mapping: %+v", got)
+	}
+	if got := find(r, "example event"); len(got) != 1 || !strings.Contains(got[0].Detail, `Show S02E05 "Pilot"`) {
+		t.Fatalf("example: %+v", got)
+	}
+}
+
+func TestSonarrCalendarWithoutSeriesFails(t *testing.T) {
+	air := time.Now().UTC().Format(time.RFC3339)
+	srv := arrServer(t, `[{"id":1,"airDateUtc":"`+air+`"}]`, nil)
+	defer srv.Close()
+	r := &Report{}
+	ProbeSonarr(context.Background(), ArrConfig{URL: srv.URL, APIKey: "arr-key"}, r)
+	if got := find(r, "event fields"); len(got) != 1 || got[0].Level != Fail {
+		t.Fatalf("expected FAIL for an episode without series, got %+v", got)
+	}
+}
+
+func TestArrBadKey(t *testing.T) {
+	srv := arrServer(t, `[]`, nil)
+	defer srv.Close()
+	r := &Report{}
+	ProbeRadarr(context.Background(), ArrConfig{URL: srv.URL, APIKey: "wrong"}, r)
+	if got := find(r, "API key"); len(got) != 1 || got[0].Level != Fail || len(r.Results) != 1 {
+		t.Fatalf("expected a single FAIL, got %+v", r.Results)
+	}
+	out, _ := json.Marshal(r.Results)
+	if strings.Contains(string(out), "wrong") {
+		t.Fatal("report contains the API key")
+	}
+}
+
+// Radarr gives up to three release dates per movie; only those in the
+// window count, and a movie whose dates all fall outside it is flagged.
+func TestRadarrReleaseDates(t *testing.T) {
+	now := time.Now().UTC()
+	soon := now.Add(72 * time.Hour).Format(time.RFC3339)
+	later := now.AddDate(0, 6, 0).Format(time.RFC3339)
+	cal := `[{"id":1,"title":"Alpha","year":2026,"inCinemas":"` + soon + `","digitalRelease":"` + later + `","rootFolderPath":"/media/movies/","path":"/media/movies/Alpha"},
+		{"id":2,"title":"Beta","year":2026,"digitalRelease":"` + soon + `","physicalRelease":"` + soon + `","hasFile":true,"path":"/media/anime/Beta"},
+		{"id":3,"title":"Gamma","year":2027,"physicalRelease":"` + later + `","path":"/elsewhere/Gamma"}]`
+	srv := arrServer(t, cal, func(req *http.Request) {
+		if req.URL.Query().Get("unmonitored") != "false" {
+			t.Errorf("calendar read with unmonitored items: %q", req.URL.RawQuery)
+		}
+	})
+	defer srv.Close()
+	r := &Report{}
+	ProbeRadarr(context.Background(), ArrConfig{URL: srv.URL, APIKey: "arr-key"}, r)
+
+	got := find(r, "release dates")
+	if len(got) != 1 || got[0].Level != Warn || !strings.Contains(got[0].Detail, "1 in cinemas, 1 digital, 1 physical; 1 movies") {
+		t.Fatalf("release dates: %+v", got)
+	}
+	if m := find(r, "root folder mapping"); len(m) != 1 || !strings.HasPrefix(m[0].Detail, "1 of 3") {
+		t.Fatalf("root folder mapping: %+v", m)
+	}
+}
+
+func TestRootOf(t *testing.T) {
+	roots := []string{"/media", "/media/tv/", `D:\TV`}
+	for path, want := range map[string]string{
+		"/media/tv/Show":   "/media/tv/",
+		"/media/Film":      "/media",
+		"/mediafiles/Show": "",
+		`D:\TV\Show`:       `D:\TV`,
+	} {
+		if got := rootOf(path, roots); got != want {
+			t.Errorf("rootOf(%q) = %q, want %q", path, got, want)
+		}
 	}
 }
