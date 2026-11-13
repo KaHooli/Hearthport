@@ -17,7 +17,7 @@
 | G11 | Optionally use an external PostgreSQL server | Built-in SQLite by default; set `HEARTHPORT_DATABASE_URL` to use PostgreSQL instead (§7.1) |
 | G12 | An easy overview of each user's services and how to use them | A dashboard home page and a left-hand category menu (TV, Movies, Books, Comics, …). Each category page shows how to **request** (e.g. Seerr) and how to **consume** (e.g. Plex), with instructions and app download links (§5.1, §5.2) |
 | G13 | Live information from the services themselves | Integrations: status checks for every service, plus Seerr requests and Plex recently added (§5.3) |
-| G14 | A calendar of what's coming up, also usable from phone and desktop calendar apps | A core calendar, shown only once a source is configured. Events come from calendar plugins (Sonarr and Radarr in v1), are filtered per user like everything else, and are published as an iCalendar feed protected by per-user keys (§5.5) |
+| G14 | A calendar of what's coming up, also usable from phone and desktop calendar apps | A core calendar, shown only once a source is configured. Events come from calendar plugins (Sonarr and Radarr in v1) and from events admins write in Hearthport. They are filtered per user like everything else, and are published as an iCalendar feed protected by per-user keys (§5.5) |
 
 ### Non-goals (v1)
 - Acting as a reverse proxy or forward-auth provider (Authentik's outposts already do this).
@@ -491,7 +491,7 @@ In a later release (v1.1), Hearthport will be installable as a PWA, so it can li
 
 ### 5.5 Calendar
 
-A calendar is a core part of Hearthport. It shows what is coming up in the services a user can access, for example new TV episodes and movie releases. Each user can also subscribe to it from the calendar app on their phone or computer.
+A calendar is a core part of Hearthport. It shows what is coming up: new TV episodes and movie releases in the services a user can access, and events written by admins. Each user can also subscribe to it from the calendar app on their phone or computer.
 
 **Core and plugins**
 - **The core** owns everything that is the same for every source:
@@ -516,18 +516,50 @@ A calendar is a core part of Hearthport. It shows what is coming up in the servi
 - **Fetched once for everyone:** events are read server-wide with the integration's admin key, cached for `HEARTHPORT_CALENDAR_CACHE_TTL` (default 15 minutes), and then filtered per user. Adding users doesn't add calls to Sonarr or Radarr.
 
 **Shown only when configured**
-- The calendar is shown only when at least one integration has calendar events switched on.
-- Each user sees it only if they can access at least one of those integrations' services.
+- The calendar is shown only when at least one source is switched on:
+  - an integration with calendar events switched on, at `/admin/integrations`, or
+  - the built-in **Hearthport events** source, at `/admin/calendar` (see below).
+- Each user sees it only if they can see at least one switched-on source: a plugin whose service they can access, or the built-in source.
 - Otherwise there is no Calendar menu item, no "Upcoming" widget and no Subscribe page, and `/calendar*` and `/cal/*` return 404.
-- Admins switch calendar events on per integration at `/admin/integrations`.
 
 **Who sees which events** (the same rules as the rest of the portal)
-- An event is shown only to users who can see its service: an Authentik app returned by `for_user` (§5), or a custom link through its groups (§5.1).
+- A plugin event is shown only to users who can see its service: an Authentik app returned by `for_user` (§5), or a custom link through its groups (§5.1).
 - **Category mapping** (optional, per integration) uses `integration_mappings`, as for Plex libraries (§5.3):
   - Sonarr root folder or tag → category, e.g. `/media/tv` → TV, `/media/anime` → Anime
   - Radarr root folder or tag → category, e.g. `/media/movies` → Movies, tag `kids` → Kids
   - Each mapping can be limited to selected Authentik groups. Unmapped items take the service's own visibility.
 - **User choices:** each user can choose which sources and categories to include. The same choice applies to the page, the widget and their feeds.
+
+**Built-in source: Hearthport events**
+
+Admins can write their own events, such as maintenance windows, a movie night or a new service launch. This source is part of the core, not a plugin. It needs no integration or service, and it implements the same `CalendarSource` interface, reading from the database.
+
+- **Turning it on:** a switch at `/admin/calendar`, off by default, stored as `calendar.events_enabled` in `settings`. Switching it off hides the source's events but keeps them.
+- **Event fields:**
+  - title (plain text)
+  - Markdown description, sanitised (§9)
+  - optional location, and an optional `http(s)` link
+  - start and end, or all day
+  - an IANA time zone (default: the admin's browser zone when the event is created)
+  - optional category, for colour and the user's category filter
+- **Repeats:** none, daily, weekly (on chosen weekdays), monthly or yearly.
+  - Each has an interval, and an end that is never, an end date or a number of times.
+  - They are stored as an RRULE subset (`FREQ`, `INTERVAL`, `BYDAY`, `UNTIL`, `COUNT`).
+  - Single occurrences can be cancelled or moved, using an exceptions list.
+  - Occurrences are worked out in the event's own time zone, so a weekly 8 pm event stays at 8 pm across daylight-saving changes.
+- **Who sees it:** all signed-in users, or only selected Authentik groups (matched against the `groups` claim), as with announcements (§5.2).
+- **On the page:** the events show a distinct "Hearthport" icon and label. Clicking one opens its details (`GET /calendar/events/{id}`, visibility checked).
+- **In the feed:**
+  - Repeating events are expanded on the server, over the feed window, into single occurrences in UTC. Their UIDs are `hp-event-{id}-{yyyymmdd}@{host}`.
+  - Because of this, every calendar app shows the right times and cancellations without needing `VTIMEZONE` data or `EXDATE` support.
+  - `DESCRIPTION` is the Markdown as plain text, never HTML. `LOCATION` and `URL` are filled in when set.
+  - Editing an event increments its `SEQUENCE`. A deleted event disappears from the next feed response.
+- **User choices:** "Hearthport events" can be included or excluded like any other source.
+- **Admin UI (`/admin/calendar`):**
+  - the on/off switch
+  - upcoming and past events, with create, edit, duplicate and delete
+  - a "who will see this" preview by group
+  - Changes are audit-logged.
 
 **First plugins (v1)**
 
@@ -594,6 +626,7 @@ A calendar is a core part of Hearthport. It shows what is coming up in the servi
 | `GET /widgets/*` | User | htmx fragments for integration widgets (§5.3) |
 | `GET /img/*` | User | Proxied and cached images from integrations |
 | `GET /calendar` | User (only when configured) | Calendar: agenda and month views (§5.5) |
+| `GET /calendar/events/{id}` | User (event must be visible to them) | Details of a Hearthport event (§5.5) |
 | `GET /calendar/subscribe` | User (only when configured) | Feed keys, `webcal://` link, QR code and per-app instructions |
 | `POST /calendar/keys` | User | Create a named feed key; the URL is shown once |
 | `POST /calendar/keys/{id}/revoke` · `POST /calendar/keys/{id}/regenerate` | User (own keys) or admin | Revoke or replace a feed key |
@@ -604,6 +637,7 @@ A calendar is a core part of Hearthport. It shows what is coming up in the servi
 | `GET/POST /admin/auth` | Admin | OIDC + Authentik API config, Test & confirm |
 | `GET/POST /admin/catalog` | Admin | Services, categories, sections, placements, unplaced apps, starter template, preview (§5.1) |
 | `GET/POST /admin/dashboard` | Admin | Getting-started guide and announcements (§5.2) |
+| `GET/POST /admin/calendar` | Admin | Hearthport events source on/off; create, edit, duplicate and delete events (§5.5) |
 | `GET/POST /admin/integrations` | Admin | Integration settings, library and root-folder-to-category mapping, calendar events on/off, test connection (§5.3, §5.5) |
 | `GET/POST /admin/account` | Local admin | Account page, including changing the local admin password |
 | `GET/POST /admin/account/password` | Local admin (also allowed with a `password_change_required` session) | Change password; required after logging in with a generated password |
@@ -616,7 +650,7 @@ The layout is described in §5.2. All pages are responsive, support light/dark m
 ```sql
 local_users   (id, username UNIQUE, password_hash, must_change BOOL,   -- true until a user sets the password
                password_changed_at, created_at, updated_at)
-settings      (key PRIMARY KEY, value_json, updated_at)            -- branding, guide text + version, prefs
+settings      (key PRIMARY KEY, value_json, updated_at)            -- branding, guide text + version, prefs, calendar.events_enabled
 oidc_configs  (id, state CHECK(state IN ('draft','confirmed','superseded')),
                issuer_url, client_id, client_secret_enc, scopes, claim_map_json,
                admin_groups_json, ak_base_url, ak_token_enc, ak_app_slug,
@@ -649,6 +683,11 @@ integration_mappings (id, integration_id REFERENCES integrations ON DELETE CASCA
 calendar_feed_keys (id, sub REFERENCES users ON DELETE CASCADE, name, key_hash UNIQUE,
                created_at, last_used_at, revoked_at)
 calendar_prefs     (sub PRIMARY KEY REFERENCES users ON DELETE CASCADE, sources_json, categories_json)
+calendar_events    (id, title, body_md, location, url, starts_at, ends_at, all_day BOOL, tz,
+               rrule, exceptions_json,                              -- cancelled or moved occurrences
+               category_id REFERENCES categories ON DELETE SET NULL,
+               visibility CHECK(visibility IN ('all','groups')), groups_json,
+               sequence, created_by, created_at, updated_at)
 
 -- Users and dashboard (§5.2)
 users         (sub PRIMARY KEY, username, email, last_login_at,   -- OIDC users, no credentials
@@ -731,7 +770,7 @@ Everything about OIDC and branding lives in the web UI, as required.
 - Outbound Authentik calls have timeouts, TLS verification is on (custom CA supported), and response sizes are capped.
 - Open-redirect protection: post-login `return_to` must be a relative path.
 - Uploaded logos and icons are type-checked, size-capped, and re-served with a fixed content type.
-- All admin-written Markdown (login message, guide, announcements, category intros, service instructions, notes) is rendered and then sanitised with `bluemonday`. Only `http(s)` links are allowed.
+- All admin-written Markdown (login message, guide, announcements, category intros, service instructions, notes, calendar event descriptions) is rendered and then sanitised with `bluemonday`. Only `http(s)` links are allowed.
 - Integrations:
   - API keys are encrypted at rest, write-only in the UI, and never sent to the browser or logged.
   - Outbound calls are limited to admin-configured hosts, with timeouts, size limits and no cross-host redirects.
@@ -814,7 +853,8 @@ internal/dashboard/       guide, announcements, favourites
 internal/integrations/    Integration interface, registry, cache, image proxy
   status/ seerr/ plex/      one package per integration type
   sonarr/ radarr/           calendar plugins (§5.5)
-internal/calendar/        event model, per-user filtering, ICS writer, feed keys
+internal/calendar/        event model, per-user filtering, ICS writer, feed keys,
+                          built-in Hearthport events source and recurrence expansion
 internal/web/             router, handlers, middleware, templates/, static/
 assets/                   brand artwork source (SVG + generated PNG/ICO); copied into
                           internal/web/static/brand/ at build time and embedded with go:embed
@@ -863,6 +903,7 @@ Dockerfile, Makefile, .github/workflows/
 - Seerr "Your requests", and Plex "Recently added" with library-to-category mapping and per-user library access (plex.tv or Tautulli, with group visibility as the fallback).
 - Calendar (§5.5):
   - core: event model, per-user filtering, page, "Upcoming" widget, user choices
+  - built-in Hearthport events source with repeats, group targeting and `/admin/calendar`
   - per-user iCalendar feeds with feed keys
   - Sonarr and Radarr plugins with root-folder and tag mapping
   - feeds tested in iOS/macOS Calendar, Google Calendar, Outlook and Thunderbird
@@ -903,11 +944,16 @@ Dockerfile, Makefile, .github/workflows/
 19. With `HEARTHPORT_DATABASE_URL` unset, Hearthport uses SQLite. With it set, Hearthport uses PostgreSQL, and every other criterion passes on both.
 20. With PostgreSQL and no `/data` volume, Hearthport keeps its data across container recreation, as long as `HEARTHPORT_SECRET_KEY` is set. Starting with the wrong key fails with a clear error.
 21. `hearthport migrate-db` moves an existing SQLite install to PostgreSQL with no loss of settings, catalog, favourites or the admin password.
-22. With no calendar plugin switched on, there is no Calendar menu item or "Upcoming" widget, and `/calendar` and `/cal/*` return 404. After switching on Sonarr, the calendar appears for users who can access the Sonarr service, and only for them.
+22. With no calendar source switched on, there is no Calendar menu item or "Upcoming" widget, and `/calendar` and `/cal/*` return 404. After switching on Sonarr, the calendar appears for users who can access the Sonarr service, and only for them. Switching on only the built-in Hearthport events source also shows the calendar.
 23. A user sees calendar events only for services, and mapped categories, that they can access. The feed for their key contains exactly the same events as their calendar page.
 24. A feed key subscribed in iOS Calendar, Google Calendar and Thunderbird shows the events, and updates them without duplicates. A revoked or regenerated key returns 404.
 25. When a user's access to Hearthport is removed in Authentik, their feed returns 404 within the cache TTL, and their keys are revoked. Keys stop working after `HEARTHPORT_CALENDAR_FEED_MAX_IDLE` without a sign-in.
 26. No feed key or integration API key appears in any log line, and no feed contains a Sonarr or Radarr API key.
+27. A weekly Hearthport event limited to one group:
+    - appears only for that group's members, on the page and in their feeds
+    - keeps its local time across a daylight-saving change
+    - disappears from both when one occurrence is cancelled
+    - shows its changes in subscribed calendar apps when edited, without duplicates
 
 ## 14. Decisions
 
@@ -926,6 +972,6 @@ Dockerfile, Makefile, .github/workflows/
 | 11 | Installable app | PWA in a later update (v1.1); v1 lays the groundwork (§5.4) |
 | 12 | Jellyfin | Moved to later; the target server runs Plex. The Phase 0 findings are kept in §5.3 (2026-10-02) |
 | 13 | Authentik setup | One-button setup with a one-time token, or a generated blueprint, following nextrmnl; manual setup stays available (§4.2.1–§4.2.3) |
-| 14 | Calendar | Core feature, shown only once a calendar plugin is configured. Media sources are compiled-in plugins (Sonarr and Radarr in v1, Lidarr and Readarr later). Feeds use per-user, per-device keys that are stored hashed, can be revoked, and expire when unused (§5.5) (2026-11-13) |
+| 14 | Calendar | Core feature, shown only once a source is switched on. Media sources are compiled-in plugins (Sonarr and Radarr in v1, Lidarr and Readarr later); admin-written events are a built-in source with repeats and group targeting. Feeds use per-user, per-device keys that are stored hashed, can be revoked, and expire when unused (§5.5) (2026-11-13) |
 
 No open questions remain. Anything new that comes up in the Phase 0 spike will be added here.

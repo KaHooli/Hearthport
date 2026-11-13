@@ -6,8 +6,8 @@ A self-hosted, Docker-deployable application portal. Users sign in through
 [Authentik](https://goauthentik.io/) (OIDC) and see only the applications
 Authentik says they are allowed to access.
 
-Once a source such as Sonarr or Radarr is configured, Hearthport also shows a
-calendar of upcoming episodes and releases. Each user can subscribe to it from
+Once a source is configured, such as Sonarr, Radarr or events written by an admin,
+Hearthport also shows a calendar of upcoming episodes, releases and events. Each user can subscribe to it from
 their phone or computer through a private calendar feed
 ([design](docs/PLAN.md#55-calendar)).
 
