@@ -1,5 +1,5 @@
 // Command hearthport-probe runs read-only checks against Authentik, Seerr,
-// Jellyfin, Plex and Tautulli, and prints a Markdown report. It never changes
+// Jellyfin, Plex, Tautulli, Sonarr and Radarr, and prints a Markdown report. It never changes
 // anything on those servers: every request it makes is an HTTP GET.
 //
 // Configure it with environment variables; any service whose URL is unset is
@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,6 +54,13 @@ func main() {
 	if u := env("HP_TAUTULLI_URL"); u != "" {
 		probe.ProbeTautulli(ctx, probe.TautulliConfig{URL: u, APIKey: env("HP_TAUTULLI_API_KEY")}, r)
 	}
+	days := envInt("HP_CALENDAR_DAYS", 30)
+	if u := env("HP_SONARR_URL"); u != "" {
+		probe.ProbeSonarr(ctx, probe.ArrConfig{URL: u, APIKey: env("HP_SONARR_API_KEY"), Days: days}, r)
+	}
+	if u := env("HP_RADARR_URL"); u != "" {
+		probe.ProbeRadarr(ctx, probe.ArrConfig{URL: u, APIKey: env("HP_RADARR_API_KEY"), Days: days}, r)
+	}
 
 	if len(r.Results) == 0 {
 		flag.Usage()
@@ -79,6 +87,11 @@ var envHelp = [][2]string{
 	{"HP_PLEX_TOKEN", "server owner's X-Plex-Token"},
 	{"HP_TAUTULLI_URL", "e.g. http://tautulli.lan:8181"},
 	{"HP_TAUTULLI_API_KEY", "Tautulli API key"},
+	{"HP_SONARR_URL", "e.g. http://sonarr.lan:8989"},
+	{"HP_SONARR_API_KEY", "Sonarr API key (Settings → General)"},
+	{"HP_RADARR_URL", "e.g. http://radarr.lan:7878"},
+	{"HP_RADARR_API_KEY", "Radarr API key (Settings → General)"},
+	{"HP_CALENDAR_DAYS", "days ahead to read Sonarr/Radarr calendars (default 30)"},
 }
 
 func env(k string) string { return strings.TrimSpace(os.Getenv(k)) }
@@ -86,6 +99,13 @@ func env(k string) string { return strings.TrimSpace(os.Getenv(k)) }
 func envOr(k, def string) string {
 	if v := env(k); v != "" {
 		return v
+	}
+	return def
+}
+
+func envInt(k string, def int) int {
+	if n, err := strconv.Atoi(env(k)); err == nil && n > 0 {
+		return n
 	}
 	return def
 }

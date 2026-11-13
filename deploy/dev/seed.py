@@ -9,6 +9,9 @@ Creates, idempotently:
   Jellyfin   admin jfadmin, Movies + TV libraries with tiny generated files,
              users alice (Movies only) and bob (both), an API key.
   Seerr      initialised against Jellyfin, alice and bob imported with emails.
+  Sonarr,    only waited for: their API keys are fixed in compose.spike.yml.
+  Radarr     Adding series or movies needs TVDB/TMDB access, so their calendars
+             start empty and the probe reports "nothing to check" until you add some.
 
 Prints the HP_* environment variables for cmd/hearthport-probe.
 Dev only: uses fixed, well-known passwords. Python 3 standard library only.
@@ -19,6 +22,8 @@ from http.cookiejar import CookieJar
 AK, JF, SR = "http://127.0.0.1:9000/api/v3", "http://127.0.0.1:8096", "http://127.0.0.1:5055/api/v1"
 AK_BOOTSTRAP = "dev-bootstrap-token-0123456789abcdef"
 JF_AUTH = 'MediaBrowser Client="hearthport-seed", Device="seed", DeviceId="hearthport-seed", Version="0.1"'
+SONARR, SONARR_KEY = "http://127.0.0.1:8989", "devsonarrkey0123456789abcdef0000"
+RADARR, RADARR_KEY = "http://127.0.0.1:7878", "devradarrkey0123456789abcdef0000"
 COMPOSE = ["docker", "compose", "-f", "deploy/dev/compose.spike.yml"]
 
 
@@ -200,9 +205,16 @@ def seed_seerr():
     return {"HP_SEERR_URL": "http://127.0.0.1:5055", "HP_SEERR_API_KEY": key, "HP_SEERR_TEST_EMAILS": "alice@example.test,bob@example.test"}
 
 
+# ------------------------------------------------------------ Sonarr, Radarr
+def seed_arr():
+    for base, key in ((SONARR, SONARR_KEY), (RADARR, RADARR_KEY)):
+        wait(base + "/api/v3/system/status?apikey=" + key)
+    return {"HP_SONARR_URL": SONARR, "HP_SONARR_API_KEY": SONARR_KEY, "HP_RADARR_URL": RADARR, "HP_RADARR_API_KEY": RADARR_KEY}
+
+
 if __name__ == "__main__":
     env = {}
-    for step in (seed_authentik, seed_jellyfin, seed_seerr):
+    for step in (seed_authentik, seed_jellyfin, seed_seerr, seed_arr):
         print(f"seeding {step.__name__[5:]}…", file=sys.stderr)
         env.update(step())
     print("export NO_PROXY=127.0.0.1,localhost")
