@@ -125,6 +125,7 @@ func ProbePlex(ctx context.Context, cfg PlexConfig, r *Report) {
 		return
 	}
 	lines := []string{}
+	idOnly := 0
 	for _, s := range shared.SharedServers {
 		n := 0
 		for _, sec := range s.Sections {
@@ -136,11 +137,18 @@ func ProbePlex(ctx context.Context, cfg PlexConfig, r *Report) {
 		if who == "" {
 			who = s.Email
 		}
+		if who == "" {
+			// Seen on real servers (likely Plex Home members): no username or
+			// email, so the Plex user ID is the only thing to match on.
+			who = "Plex user #" + s.UserID
+			idOnly++
+		}
 		all := ""
 		if s.AllLibs == "1" {
 			all = " (all libraries)"
 		}
 		lines = append(lines, who+": "+itoa(n)+"/"+itoa(len(s.Sections))+all)
 	}
-	r.Add(svc, "per-user sharing", Pass, "plex.tv reports shared sections for %d users: %s", len(shared.SharedServers), strings.Join(lines, "; "))
+	r.Add(svc, "per-user sharing", Pass, "plex.tv reports shared sections for %d users (%d with neither username nor email): %s",
+		len(shared.SharedServers), idOnly, strings.Join(lines, "; "))
 }

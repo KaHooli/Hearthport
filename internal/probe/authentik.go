@@ -2,6 +2,7 @@ package probe
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/url"
 	"sort"
@@ -85,6 +86,7 @@ func ProbeAuthentik(ctx context.Context, cfg AuthentikConfig, c *Client, r *Repo
 	if len(cfg.TestUsers) == 0 {
 		r.Add(svc, "per-user apps", Skip, "no test users given (HP_AUTHENTIK_TEST_USERS)")
 	}
+	usersForbidden := false
 	for _, entry := range cfg.TestUsers {
 		username, pkText, hasPK := strings.Cut(entry, "=")
 		if hasPK {
@@ -96,25 +98,46 @@ func ProbeAuthentik(ctx context.Context, cfg AuthentikConfig, c *Client, r *Repo
 			akCheckUserApps(ctx, c, r, cfg, username, pk)
 			continue
 		}
-		var users akPage[akUser]
-		err := c.GetJSON(ctx, "/core/users/", url.Values{"username": {username}}, &users)
+		u, by, err := akLookupUser(ctx, c, username)
 		switch {
 		case StatusOf(err) == http.StatusForbidden:
+			usersForbidden = true
 			r.Add(svc, "user lookup", Fail, "403 looking up %q: the token needs authentik_core.view_user (or Hearthport must get the user's pk from a claim)", username)
 			continue
 		case err != nil:
 			r.Add(svc, "user lookup", Fail, "looking up %q: %v", username, err)
 			continue
-		case len(users.Results) != 1:
-			r.Add(svc, "user lookup", Fail, "%d users match username %q", len(users.Results), username)
-			continue
 		}
-		u := users.Results[0]
-		r.Add(svc, "user lookup", Pass, "%q has pk %d", username, u.PK)
+		r.Add(svc, "user lookup", Pass, "%q has pk %d (found by %s; username %q)", username, u.PK, by, u.Username)
 		akCheckUserApps(ctx, c, r, cfg, username, u.PK)
 	}
 
-	akUnboundApps(ctx, c, r, me.User.IsSuperuser)
+	bindingsForbidden := akUnboundApps(ctx, c, r, me.User.IsSuperuser)
+	if usersForbidden && bindingsForbidden {
+		r.Add(svc, "token permissions", Warn, "the token can read neither users nor policy bindings. Check that the role is assigned to the service account and that its permissions were saved")
+	}
+}
+
+// akLookupUser finds exactly one user by username, then, for values that look
+// like an email address, by email: many installs use emails as login names
+// while the username itself is something else.
+func akLookupUser(ctx context.Context, c *Client, value string) (akUser, string, error) {
+	fields := []string{"username"}
+	if strings.Contains(value, "@") {
+		fields = append(fields, "email")
+	}
+	counts := []string{}
+	for _, field := range fields {
+		var users akPage[akUser]
+		if err := c.GetJSON(ctx, "/core/users/", url.Values{field: {value}}, &users); err != nil {
+			return akUser{}, "", err
+		}
+		if len(users.Results) == 1 {
+			return users.Results[0], field, nil
+		}
+		counts = append(counts, fmt.Sprintf("%d by %s", len(users.Results), field))
+	}
+	return akUser{}, "", fmt.Errorf("no single user matches (%s); give it as name=pk instead", strings.Join(counts, ", "))
 }
 
 // akCheckUserApps lists one user's applications and checks Hearthport's own slug is among them.
@@ -179,7 +202,7 @@ func akAppsForUser(ctx context.Context, c *Client, pk int) (apps []akApp, pages,
 //
 // Only a superuser token sees every application; any other token sees the
 // apps its own account can open, so the result then covers those only.
-func akUnboundApps(ctx context.Context, c *Client, r *Report, superuser bool) {
+func akUnboundApps(ctx context.Context, c *Client, r *Report, superuser bool) (forbidden bool) {
 	const svc = "Authentik"
 	var all []akApp
 	page := 1
@@ -188,7 +211,7 @@ func akUnboundApps(ctx context.Context, c *Client, r *Report, superuser bool) {
 		err := c.GetJSON(ctx, "/core/applications/", url.Values{"superuser_full_list": {"true"}, "page": {strconv.Itoa(page)}, "page_size": {"100"}}, &p)
 		if err != nil {
 			r.Add(svc, "apps without bindings", Skip, "could not list all applications: %v", err)
-			return
+			return false
 		}
 		all = append(all, p.Results...)
 		page = p.Pagination.Next
@@ -199,11 +222,11 @@ func akUnboundApps(ctx context.Context, c *Client, r *Report, superuser bool) {
 		err := c.GetJSON(ctx, "/policies/bindings/", url.Values{"target": {a.PBMUUID}, "page_size": {"1"}}, &b)
 		if StatusOf(err) == http.StatusForbidden {
 			r.Add(svc, "apps without bindings", Skip, "token cannot read policy bindings (needs authentik_policies.view_policybinding); skipped")
-			return
+			return true
 		}
 		if err != nil {
 			r.Add(svc, "apps without bindings", Skip, "reading bindings: %v", err)
-			return
+			return false
 		}
 		if b.Pagination.Count == 0 {
 			unbound = append(unbound, a.Slug)
@@ -211,7 +234,7 @@ func akUnboundApps(ctx context.Context, c *Client, r *Report, superuser bool) {
 	}
 	if len(all) == 0 {
 		r.Add(svc, "apps without bindings", Skip, "token can only see its own applications (superuser_full_list needs a superuser)")
-		return
+		return false
 	}
 	scope := "apps"
 	if !superuser {
@@ -226,4 +249,5 @@ func akUnboundApps(ctx context.Context, c *Client, r *Report, superuser bool) {
 	} else {
 		r.Add(svc, "apps without bindings", Pass, "all %d %s have at least one binding", len(all), scope)
 	}
+	return false
 }

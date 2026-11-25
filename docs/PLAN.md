@@ -433,9 +433,9 @@ Integrations add live information from the services themselves.
   1. plex.tv `GET /api/servers/<machineIdentifier>/shared_servers` with the owner's token: one `SharedServer` per user with `Section shared="1"` entries. Each user's access token in that response is ignored and never stored.
   2. Tautulli `cmd=get_users`, which returns `shared_libraries` for each user. This needs a Tautulli integration.
 
-  The Hearthport user is matched to the Plex user by email or username.
+  The Hearthport user is matched to the Plex user by **email first, then username, then Plex user ID**. On the target server, 4 of 15 shared users had neither a username nor an email in `shared_servers` (likely Plex Home members). They can only be matched through their Plex user ID, which Tautulli also reports with its users.
 - **Fallback:** if neither source works, each mapped section has its own visibility setting (all users or selected Authentik groups), which the admin sets to match their Plex sharing.
-- Both sources still need confirming on a real claimed server; the probe tool checks them (docs/spike/phase0.md).
+- **Confirmed on the target server (2026-11-25):** plex.tv returned per-user sections for all 15 shared users, and Tautulli 2.19.1 returned `shared_libraries` for 21 of 22 users. plex.tv is the primary source and Tautulli the fallback (docs/spike/phase0.md).
 
 **Later (v1.x)**: Jellyfin, Audiobookshelf, Kavita, Komga and Tautulli, built on the same interface.
 - **Jellyfin design note** (from Phase 0, confirmed on Jellyfin 12.1.0):
@@ -718,9 +718,9 @@ Dockerfile, Makefile, .github/workflows/
 - Confirmed: `for_user` app discovery and the minimum service-account permissions; Seerr per-user requests with `X-API-User`; Jellyfin per-user recently added; Plex sections and recently added.
 - A read-only probe tool (`cmd/hearthport-probe`) for checking real servers.
 - **Still to confirm on the real network** (blocked from the build sandbox):
-  - Seerr title lookups (TMDB)
-  - the `seerrng` fork's API
-  - Plex per-user sharing via plex.tv and Tautulli
+  - Seerr title lookups (TMDB) and email matching on the `seerrng` fork (its API key works)
+  - Authentik `for_user` with the owner's real users
+  - ~~Plex per-user sharing~~: confirmed on the target server via plex.tv and Tautulli via plex.tv and Tautulli
 
 **Phase 1: Skeleton & bootstrap**
 - Go module, config, structured logging, `/healthz` and `/readyz`.

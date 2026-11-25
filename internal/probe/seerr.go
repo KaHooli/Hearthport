@@ -71,6 +71,10 @@ func ProbeSeerr(ctx context.Context, cfg SeerrConfig, r *Report) {
 		r.Add(svc, "user matching", Skip, "no test emails given (HP_SEERR_TEST_EMAILS)")
 	}
 	for _, email := range cfg.TestEmails {
+		if isPlaceholderEmail(email) {
+			r.Add(svc, "user matching", Warn, "%s looks like a placeholder; put a real user's email in HP_SEERR_TEST_EMAILS", email)
+			continue
+		}
 		var found struct {
 			Results []seerrUser `json:"results"`
 		}
@@ -132,6 +136,18 @@ func ProbeSeerr(ctx context.Context, cfg SeerrConfig, r *Report) {
 			}
 		}
 	}
+}
+
+// isPlaceholderEmail spots the documentation example domains, which the
+// probe's own instructions use, so a copied example doesn't look like a real
+// miss. example.test is left alone: the throwaway test stack uses it.
+func isPlaceholderEmail(email string) bool {
+	_, domain, _ := strings.Cut(strings.ToLower(email), "@")
+	switch domain {
+	case "example.com", "example.org", "example.net":
+		return true
+	}
+	return false
 }
 
 func seerrUserType(t int) string {
