@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func find(r *Report, check string) []Result {
@@ -288,5 +289,52 @@ func TestPlexSharedUserWithoutNameShowsID(t *testing.T) {
 	s := find(r, "per-user sharing")
 	if len(s) != 1 || !strings.Contains(s[0].Detail, "Plex user #77: 1/1") || !strings.Contains(s[0].Detail, "1 with neither username nor email") {
 		t.Fatalf("unexpected sharing result: %+v", s)
+	}
+}
+
+// Seerr can take a long time to build request lists (it checks Radarr and
+// Sonarr), so the probe times them and reports a slow or hung list clearly.
+func TestSeerrSlowRequestListIsTimed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/api/v1/status":
+			fmt.Fprint(w, `{"version":"3.5.0"}`)
+		case "/api/v1/user":
+			fmt.Fprint(w, `{"pageInfo":{"results":1},"results":[{"id":2,"email":"jo@example.test","userType":1}]}`)
+		case "/api/v1/request":
+			time.Sleep(300 * time.Millisecond)
+			fmt.Fprint(w, `{"pageInfo":{"results":0},"results":[]}`)
+		default:
+			http.NotFound(w, req)
+		}
+	}))
+	defer srv.Close()
+	r := &Report{}
+	ProbeSeerr(context.Background(), SeerrConfig{URL: srv.URL, APIKey: "k", TestEmails: []string{"jo@example.test"}, RequestTimeout: 100 * time.Millisecond}, r)
+	speed := find(r, "request list speed")
+	if len(speed) != 1 || speed[0].Level != Warn || !strings.Contains(speed[0].Detail, "failed") {
+		t.Fatalf("expected a WARN noting the timeout, got %+v", speed)
+	}
+	if got := find(r, "own requests"); len(got) != 1 || got[0].Level != Fail {
+		t.Fatalf("expected own requests to FAIL after the timeout, got %+v", got)
+	}
+}
+
+func TestAuthentikNoUnboundAppsPasses(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/core/users/me/":
+			fmt.Fprint(w, `{"user":{"pk":9,"username":"sa"}}`)
+		case "/core/applications/":
+			fmt.Fprint(w, `{"pagination":{"next":0},"results":[]}`)
+		default:
+			http.Error(w, "forbidden", http.StatusForbidden)
+		}
+	}))
+	defer srv.Close()
+	r := &Report{}
+	ProbeAuthentik(context.Background(), AuthentikConfig{}, NewClient(srv.URL, nil, defaultTimeout), r)
+	if got := find(r, "apps without bindings"); len(got) != 1 || got[0].Level != Pass {
+		t.Fatalf("expected PASS when the token sees no open apps, got %+v", got)
 	}
 }

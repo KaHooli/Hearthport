@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // SeerrConfig holds the settings for the Seerr (Overseerr/Jellyseerr) checks.
@@ -14,7 +15,18 @@ type SeerrConfig struct {
 	URL        string
 	APIKey     string
 	TestEmails []string // Hearthport users' emails, matched to Seerr users
+	// RequestTimeout limits the request-list calls, which Seerr can be slow
+	// to answer because it checks Radarr and Sonarr while building them.
+	// Defaults to seerrRequestTimeout.
+	RequestTimeout time.Duration
 }
+
+const (
+	seerrRequestTimeout = 90 * time.Second
+	// seerrSlow is when a request list is slow enough that Hearthport must
+	// load it after the page and cache it.
+	seerrSlow = 5 * time.Second
+)
 
 type seerrUser struct {
 	ID               int    `json:"id"`
@@ -97,14 +109,37 @@ func ProbeSeerr(ctx context.Context, cfg SeerrConfig, r *Report) {
 		u := exact[0]
 		r.Add(svc, "user matching", Pass, "%s → Seerr user %d (%s)", email, u.ID, seerrUserType(u.UserType))
 
-		asUser := NewClient(base, http.Header{"X-Api-Key": {cfg.APIKey}, "X-Api-User": {strconv.Itoa(u.ID)}, "Accept": {"application/json"}}, defaultTimeout)
-		var reqs struct {
+		timeout := cfg.RequestTimeout
+		if timeout == 0 {
+			timeout = seerrRequestTimeout
+		}
+		asUser := NewClient(base, http.Header{"X-Api-Key": {cfg.APIKey}, "X-Api-User": {strconv.Itoa(u.ID)}, "Accept": {"application/json"}}, timeout)
+		type requestPage struct {
 			PageInfo struct {
 				Results int `json:"results"`
 			} `json:"pageInfo"`
 			Results []seerrRequest `json:"results"`
 		}
-		if err := asUser.GetJSON(ctx, "/request", url.Values{"take": {"20"}, "sort": {"added"}, "requestedBy": {strconv.Itoa(u.ID)}}, &reqs); err != nil {
+		// Time one request first, then twenty, to tell a fixed delay (such as
+		// Seerr waiting on Radarr or Sonarr) from a cost per request.
+		listQuery := func(take string) url.Values {
+			return url.Values{"take": {take}, "sort": {"added"}, "requestedBy": {strconv.Itoa(u.ID)}}
+		}
+		var one requestPage
+		start := time.Now()
+		errOne := asUser.GetJSON(ctx, "/request", listQuery("1"), &one)
+		tookOne := time.Since(start)
+		var reqs requestPage
+		start = time.Now()
+		err := asUser.GetJSON(ctx, "/request", listQuery("20"), &reqs)
+		took := time.Since(start)
+		speed := Pass
+		if took > seerrSlow || errOne != nil || err != nil {
+			speed = Warn
+		}
+		r.Add(svc, "request list speed", speed, "%s: 1 request in %s%s, 20 requests in %s (limit %s)",
+			email, tookOne.Round(100*time.Millisecond), errNote(errOne), took.Round(100*time.Millisecond), timeout)
+		if err != nil {
 			r.Add(svc, "own requests", Fail, "%s: %v", email, err)
 			continue
 		}
@@ -148,6 +183,13 @@ func isPlaceholderEmail(email string) bool {
 		return true
 	}
 	return false
+}
+
+func errNote(err error) string {
+	if err == nil {
+		return ""
+	}
+	return " (failed: " + err.Error() + ")"
 }
 
 func seerrUserType(t int) string {

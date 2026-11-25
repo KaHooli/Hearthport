@@ -233,7 +233,9 @@ func akUnboundApps(ctx context.Context, c *Client, r *Report, superuser bool) (f
 		}
 	}
 	if len(all) == 0 {
-		r.Add(svc, "apps without bindings", Skip, "token can only see its own applications (superuser_full_list needs a superuser)")
+		// A non-superuser token sees the apps its own account can open, which
+		// always includes every unbound app, so seeing none means there are none.
+		r.Add(svc, "apps without bindings", Pass, "no application is open to every Authentik user")
 		return false
 	}
 	scope := "apps"

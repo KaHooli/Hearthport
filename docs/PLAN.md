@@ -424,6 +424,10 @@ Integrations add live information from the services themselves.
   - Users Seerr imported from Jellyfin have their username as their email until they set one, so username matching is the fallback for them.
 - Every call for a user sends the API key **and `X-API-User: <seerr id>`**. Seerr then acts as that user and refuses to return anyone else's requests, even if Hearthport has a bug.
 - Request results contain only TMDB IDs. Titles and posters come from Seerr's `/movie/{id}` and `/tv/{id}`, cached for a day. A request still shows if that lookup fails.
+- **The request list can be slow.** Seerr checks Radarr and Sonarr while building it, and on the target server it didn't answer within 15 seconds (docs/spike/phase0.md). So the "Your requests" widget:
+  - gets its own, longer timeout (`HEARTHPORT_SEERR_TIMEOUT`, default 60s) instead of the general integration timeout
+  - is refreshed in the background, so a user's page always shows the last cached list (marked with when it was fetched) and never waits on Seerr
+  - shows "Seerr is slow to respond" rather than an error when a refresh times out
 - **"Your requests" widget**: the user's recent requests with their title, poster and status (pending, approved, available, declined), each linking to the item in Seerr.
 - Only the matched user's own requests are shown. If there's no match, the widget explains that the user needs to sign in to Seerr first.
 
@@ -608,6 +612,7 @@ Uploaded files (logo, service icons) are stored in the database rather than on d
 | `HEARTHPORT_APP_CACHE_TTL` | `60s` | Per-user app list cache |
 | `HEARTHPORT_STATUS_INTERVAL` | `60s` | How often service status checks run (§5.3) |
 | `HEARTHPORT_INTEGRATION_TIMEOUT` | `5s` | Timeout for each integration API call |
+| `HEARTHPORT_SEERR_TIMEOUT` | `60s` | Timeout for Seerr request lists, which can be slow (§5.3) |
 | `HEARTHPORT_INTEGRATION_CACHE_TTL` | `5m` | Cache lifetime for integration lists (recently added, requests) |
 | `HEARTHPORT_LOG_LEVEL` / `_FORMAT` | `info` / `text` | Logging (`json` available) |
 | `HEARTHPORT_CA_FILE` | — | Extra CA bundle for privately signed Authentik or PostgreSQL certificates |
@@ -718,7 +723,7 @@ Dockerfile, Makefile, .github/workflows/
 - Confirmed: `for_user` app discovery and the minimum service-account permissions; Seerr per-user requests with `X-API-User`; Jellyfin per-user recently added; Plex sections and recently added.
 - A read-only probe tool (`cmd/hearthport-probe`) for checking real servers.
 - **Still to confirm on the real network** (blocked from the build sandbox):
-  - Seerr title lookups (TMDB) and email matching on the `seerrng` fork (its API key works)
+  - ~~Email matching on the `seerrng` fork~~: confirmed. Still open: how long its request list takes, and title lookups (TMDB)
   - ~~Authentik `for_user` with the owner's real users~~: confirmed on the target server with the least-privilege role
   - ~~Plex per-user sharing~~: confirmed on the target server via plex.tv and Tautulli via plex.tv and Tautulli
 

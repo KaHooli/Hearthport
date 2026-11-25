@@ -19,7 +19,7 @@ import (
 
 func main() {
 	redact := flag.Bool("redact", true, "mask email addresses in the report")
-	timeout := flag.Duration("timeout", 2*time.Minute, "overall time limit")
+	timeout := flag.Duration("timeout", 10*time.Minute, "overall time limit")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: hearthport-probe [-redact=false] [-timeout=2m]")
 		fmt.Fprintln(os.Stderr, "\nEnvironment (services with no URL are skipped):")
