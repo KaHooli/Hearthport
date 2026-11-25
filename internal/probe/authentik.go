@@ -86,6 +86,7 @@ func ProbeAuthentik(ctx context.Context, cfg AuthentikConfig, c *Client, r *Repo
 	if len(cfg.TestUsers) == 0 {
 		r.Add(svc, "per-user apps", Skip, "no test users given (HP_AUTHENTIK_TEST_USERS)")
 	}
+	r.Step("Authentik: checking %d test users", len(cfg.TestUsers))
 	usersForbidden := false
 	for _, entry := range cfg.TestUsers {
 		username, pkText, hasPK := strings.Cut(entry, "=")

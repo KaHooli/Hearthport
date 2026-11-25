@@ -33,6 +33,21 @@ type Result struct {
 type Report struct {
 	Results []Result
 	Redact  bool
+	// Progress, if set, receives a short line before each slow step, so a
+	// long wait doesn't look like a hang. It never goes into the report.
+	Progress func(line string)
+}
+
+// Step reports progress; it does nothing when Progress is unset.
+func (r *Report) Step(format string, args ...any) {
+	if r.Progress == nil {
+		return
+	}
+	line := fmt.Sprintf(format, args...)
+	if r.Redact {
+		line = RedactEmails(line)
+	}
+	r.Progress(line)
 }
 
 func (r *Report) Add(service, check string, level Level, format string, args ...any) {

@@ -338,3 +338,17 @@ func TestAuthentikNoUnboundAppsPasses(t *testing.T) {
 		t.Fatalf("expected PASS when the token sees no open apps, got %+v", got)
 	}
 }
+
+func TestProgressGoesToCallbackNotReport(t *testing.T) {
+	var lines []string
+	r := &Report{Redact: true, Progress: func(l string) { lines = append(lines, l) }}
+	r.Step("Seerr: listing requests for %s", "jo@example.test")
+	r.Add("Seerr", "x", Pass, "done")
+	if len(lines) != 1 || lines[0] != "Seerr: listing requests for j***@example.test" {
+		t.Fatalf("unexpected progress lines: %q", lines)
+	}
+	if len(r.Results) != 1 {
+		t.Fatalf("progress leaked into the report: %+v", r.Results)
+	}
+	(&Report{}).Step("no callback set") // must not panic
+}

@@ -87,6 +87,7 @@ func ProbePlex(ctx context.Context, cfg PlexConfig, r *Report) {
 	}
 	r.Add(svc, "library sections", Pass, "%d sections: %s", len(titles), strings.Join(titles, "; "))
 
+	r.Step("Plex: reading recently added for %d sections", len(secs.MediaContainer.Directory))
 	for _, d := range secs.MediaContainer.Directory {
 		var ra plexContainer
 		q := url.Values{"X-Plex-Container-Start": {"0"}, "X-Plex-Container-Size": {itoa(cfg.MaxItems)}}
@@ -115,6 +116,7 @@ func ProbePlex(ctx context.Context, cfg PlexConfig, r *Report) {
 	}
 	tvHdr := http.Header{"X-Plex-Token": {cfg.Token}, "X-Plex-Client-Identifier": {"hearthport-probe"}, "Accept": {"application/xml"}}
 	tv := NewClient(plexTV, tvHdr, defaultTimeout)
+	r.Step("Plex: asking plex.tv which libraries are shared with whom")
 	var shared plexSharedServers
 	if err := tv.GetXML(ctx, "/api/servers/"+url.PathEscape(machineID)+"/shared_servers", nil, &shared); err != nil {
 		r.Add(svc, "per-user sharing", Fail, "plex.tv shared_servers: %v (Hearthport would fall back to group-based visibility per section)", err)

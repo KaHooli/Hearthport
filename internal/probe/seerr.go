@@ -113,6 +113,7 @@ func ProbeSeerr(ctx context.Context, cfg SeerrConfig, r *Report) {
 		if timeout == 0 {
 			timeout = seerrRequestTimeout
 		}
+		r.Step("Seerr: listing requests for %s (each call waits up to %s)…", email, timeout)
 		asUser := NewClient(base, http.Header{"X-Api-Key": {cfg.APIKey}, "X-Api-User": {strconv.Itoa(u.ID)}, "Accept": {"application/json"}}, timeout)
 		type requestPage struct {
 			PageInfo struct {
