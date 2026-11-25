@@ -719,7 +719,7 @@ Dockerfile, Makefile, .github/workflows/
 - A read-only probe tool (`cmd/hearthport-probe`) for checking real servers.
 - **Still to confirm on the real network** (blocked from the build sandbox):
   - Seerr title lookups (TMDB) and email matching on the `seerrng` fork (its API key works)
-  - Authentik `for_user` with the owner's real users
+  - ~~Authentik `for_user` with the owner's real users~~: confirmed on the target server with the least-privilege role
   - ~~Plex per-user sharing~~: confirmed on the target server via plex.tv and Tautulli via plex.tv and Tautulli
 
 **Phase 1: Skeleton & bootstrap**

@@ -137,14 +137,15 @@ Prompted by [nextrmnl](https://github.com/DerKezorm/nextrmnl)'s "authentik butto
 
 ## Results from the target server (2026-11-25)
 
-The project owner ran the probe on their Unraid server, as a throwaway `golang:1.24` container on the `internal` Docker network that Authentik, Seerr, Plex and Tautulli share. There were two runs; the second one followed fixes to the setup.
+The project owner ran the probe on their Unraid server, as a throwaway `golang:1.24` container on the `internal` Docker network that Authentik, Seerr, Plex and Tautulli share. There were three runs, each after fixes to the setup; the third used the probe from PR #4.
 
 | Area | Version | Result |
 |---|---|---|
 | Plex server | 1.43.6 | **Confirmed.** 5 sections (Movies, Anime, Documentaries, Reality, TV Shows); recently added with artwork for each |
 | Plex per-user sharing (plex.tv) | — | **Confirmed.** `shared_servers` lists all 15 shared users with their sections (all have all 5 libraries today). **4 entries have neither username nor email**, so matching falls back to the Plex user ID (PLAN §5.3) |
 | Tautulli | 2.19.1 | **Confirmed** as the fallback. 22 users: 21 with `shared_libraries`, 16 with an email |
-| Authentik | 2026.8.6 | **Partly settled.** The token is accepted and isn't a superuser. Run 1: user lookup got 403 (the role wasn't working yet). Run 2: the lookup is allowed but finds no one, because the test values were email addresses and the usernames are something else. The bindings permission still isn't granted (optional) |
+| Authentik | 2026.8.6 | **Confirmed.** The least-privilege `hearthport-discovery` service account found the owner by email (their username differs from their login email), then listed their 45 applications with `for_user` in one page. Run 1 got 403 because the role wasn't assigned yet. In Authentik's UI, `view_user_applications` is labelled "View applications the user has access to". A second test user wasn't found by username or email; that's down to the test value, not the API |
+| Authentik unbound apps | 2026.8.6 | **Confirmed working.** With `view_policybinding` granted, the check found one real application with no bindings (open to every Authentik user), which is exactly the case §4.5 warns about |
 | Seerr (`seerrng`) | 3.72.40 | **Partly settled.** The API key works (15 users). Email matching wasn't tested: both runs still used the example placeholder emails |
 
 **Probe changes after these runs:**
@@ -153,10 +154,7 @@ The project owner ran the probe on their Unraid server, as a throwaway `golang:1
 - **Plex sharing:** an entry with no username or email now shows as `Plex user #<id>`, with a count of how many there are.
 - **Seerr test emails:** `example.com`, `example.org` and `example.net` addresses are flagged as placeholders instead of being searched.
 
-**Still to re-run** (Authentik and Seerr lines only):
-- Authentik test users given as `name=pk`, or as their real usernames.
-- Real Plex emails in `HP_SEERR_TEST_EMAILS`.
-- Optionally, "Can view Policy Binding" added to the `hearthport-discovery` role.
+**Still to re-run:** Seerr only, with real Plex emails in `HP_SEERR_TEST_EMAILS`. The third run still had the example placeholders, which the probe now flags.
 
 ## Running the probe against your servers
 
