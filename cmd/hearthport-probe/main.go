@@ -19,7 +19,7 @@ import (
 
 func main() {
 	redact := flag.Bool("redact", true, "mask email addresses in the report")
-	timeout := flag.Duration("timeout", 2*time.Minute, "overall time limit")
+	timeout := flag.Duration("timeout", 10*time.Minute, "overall time limit")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: hearthport-probe [-redact=false] [-timeout=2m]")
 		fmt.Fprintln(os.Stderr, "\nEnvironment (services with no URL are skipped):")
@@ -31,9 +31,13 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	r := &probe.Report{Redact: *redact}
+	r := &probe.Report{Redact: *redact, Progress: func(line string) {
+		// stderr, so the Markdown report on stdout stays clean.
+		fmt.Fprintf(os.Stderr, "[%s] %s\n", time.Now().Format("15:04:05"), line)
+	}}
 
 	if u := env("HP_AUTHENTIK_URL"); u != "" {
+		r.Step("Authentik: starting")
 		probe.ProbeAuthentik(ctx, probe.AuthentikConfig{
 			URL:       u,
 			Token:     env("HP_AUTHENTIK_TOKEN"),
@@ -42,15 +46,19 @@ func main() {
 		}, nil, r)
 	}
 	if u := env("HP_SEERR_URL"); u != "" {
+		r.Step("Seerr: starting")
 		probe.ProbeSeerr(ctx, probe.SeerrConfig{URL: u, APIKey: env("HP_SEERR_API_KEY"), TestEmails: list("HP_SEERR_TEST_EMAILS")}, r)
 	}
 	if u := env("HP_JELLYFIN_URL"); u != "" {
+		r.Step("Jellyfin: starting")
 		probe.ProbeJellyfin(ctx, probe.JellyfinConfig{URL: u, APIKey: env("HP_JELLYFIN_API_KEY"), TestUsers: list("HP_JELLYFIN_TEST_USERS")}, r)
 	}
 	if u := env("HP_PLEX_URL"); u != "" {
+		r.Step("Plex: starting")
 		probe.ProbePlex(ctx, probe.PlexConfig{URL: u, Token: env("HP_PLEX_TOKEN")}, r)
 	}
 	if u := env("HP_TAUTULLI_URL"); u != "" {
+		r.Step("Tautulli: starting")
 		probe.ProbeTautulli(ctx, probe.TautulliConfig{URL: u, APIKey: env("HP_TAUTULLI_API_KEY")}, r)
 	}
 

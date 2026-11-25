@@ -135,6 +135,32 @@ Prompted by [nextrmnl](https://github.com/DerKezorm/nextrmnl)'s "authentik butto
 - **Minimum discovery permissions confirmed again.** With `ak_pk` in the ID token, the discovery account needs only `authentik_core.view_user_applications`, plus `authentik_policies.view_policybinding` for the unbound-apps warning. The probe now accepts `name=pk` test users to check exactly this setup.
 - **Unbound-apps check without a superuser token.** A non-superuser token only lists apps its own account can open, but an app with no bindings is open to every account, so the check still finds all of them.
 
+## Results from the target server (2026-11-25)
+
+The project owner ran the probe on their Unraid server, as a throwaway `golang:1.24` container on the `internal` Docker network that Authentik, Seerr, Plex and Tautulli share. There were three runs, each after fixes to the setup; the third used the probe from PR #4.
+
+| Area | Version | Result |
+|---|---|---|
+| Plex server | 1.43.6 | **Confirmed.** 5 sections (Movies, Anime, Documentaries, Reality, TV Shows); recently added with artwork for each |
+| Plex per-user sharing (plex.tv) | — | **Confirmed.** `shared_servers` lists all 15 shared users with their sections (all have all 5 libraries today). **4 entries have neither username nor email**, so matching falls back to the Plex user ID (PLAN §5.3) |
+| Tautulli | 2.19.1 | **Confirmed** as the fallback. 22 users: 21 with `shared_libraries`, 16 with an email |
+| Authentik | 2026.8.6 | **Confirmed.** The least-privilege `hearthport-discovery` service account found the owner by email (their username differs from their login email), then listed their 45 applications with `for_user` in one page. Run 1 got 403 because the role wasn't assigned yet. In Authentik's UI, `view_user_applications` is labelled "View applications the user has access to". A second test user wasn't found by username or email; that's down to the test value, not the API |
+| Authentik unbound apps | 2026.8.6 | **Confirmed working.** With `view_policybinding` granted, the check found one real application with no bindings (open to every Authentik user), which is exactly the case §4.5 warns about. The owner then bound a group to it, and the next run found none |
+| Seerr (`seerrng`) | 3.72.40 | **Matching confirmed.** The API key works (15 users), and both test emails matched exactly one Seerr user, both Plex users. **The request list didn't answer within the probe's 15-second limit** for either user, so per-user scoping and title lookups couldn't be checked. Seerr checks Radarr and Sonarr while building that list, which can stall it. The probe now times it with a 90-second limit |
+
+**Probe changes after these runs:**
+- **Authentik user lookup:** an email-looking value is now also looked up by email, and a value with no single match suggests `name=pk`.
+- **Token permissions:** when the token can read neither users nor bindings, the probe now points at the role assignment.
+- **Plex sharing:** an entry with no username or email now shows as `Plex user #<id>`, with a count of how many there are.
+- **Seerr test emails:** `example.com`, `example.org` and `example.net` addresses are flagged as placeholders instead of being searched.
+
+**Still to re-run:** Seerr only, with the updated probe. It times the request list (1 request, then 20) with a 90-second limit, to find out whether the list is slow or hangs. The plan already treats it as slow (PLAN §5.3).
+
+**Further probe changes after the later runs:**
+- **Seerr request lists:** timed, with a separate 90-second limit (`request list speed` check).
+- **Authentik unbound apps:** reports PASS when the token sees no apps, because an app open to everyone would always be visible.
+- **Overall time limit:** the probe's default is now 10 minutes.
+
 ## Running the probe against your servers
 
 The probe only reads (HTTP GET), masks email addresses in its report, and never prints tokens. Run it on a machine that can reach your servers; it needs Go 1.24 or newer.

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func find(r *Report, check string) []Result {
@@ -212,4 +213,142 @@ func TestAuthentikUserPKSkipsLookup(t *testing.T) {
 	if got := find(r, "user lookup"); len(got) != 1 || got[0].Level != Fail || !strings.Contains(got[0].Detail, "not a number") {
 		t.Fatalf("expected a FAIL for the non-numeric pk, got %+v", got)
 	}
+}
+
+func TestSeerrPlaceholderEmailIsFlagged(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/api/v1/status":
+			fmt.Fprint(w, `{"version":"3.5.0"}`)
+		case "/api/v1/user":
+			if req.URL.Query().Get("q") != "" {
+				t.Error("searched Seerr for a placeholder email")
+			}
+			fmt.Fprint(w, `{"pageInfo":{"results":3},"results":[]}`)
+		default:
+			http.NotFound(w, req)
+		}
+	}))
+	defer srv.Close()
+	r := &Report{}
+	ProbeSeerr(context.Background(), SeerrConfig{URL: srv.URL, APIKey: "k", TestEmails: []string{"you@example.com"}}, r)
+	m := find(r, "user matching")
+	if len(m) != 1 || m[0].Level != Warn || !strings.Contains(m[0].Detail, "placeholder") {
+		t.Fatalf("expected a placeholder warning, got %+v", m)
+	}
+}
+
+// Real installs often log in with an email address that isn't the username,
+// so a lookup that finds nothing by username retries by email.
+func TestAuthentikLookupFallsBackToEmail(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/core/users/me/":
+			fmt.Fprint(w, `{"user":{"pk":9,"username":"sa"}}`)
+		case "/core/users/":
+			if req.URL.Query().Get("email") == "jo@example.test" {
+				fmt.Fprint(w, `{"results":[{"pk":12,"username":"jo"}]}`)
+				return
+			}
+			fmt.Fprint(w, `{"results":[]}`)
+		case "/core/applications/":
+			fmt.Fprint(w, `{"pagination":{"next":0},"results":[{"slug":"hearthport","launch_url":"http://h"}]}`)
+		default:
+			http.Error(w, "forbidden", http.StatusForbidden)
+		}
+	}))
+	defer srv.Close()
+	r := &Report{}
+	ProbeAuthentik(context.Background(), AuthentikConfig{AppSlug: "hearthport", TestUsers: []string{"jo@example.test", "nobody"}}, NewClient(srv.URL, nil, defaultTimeout), r)
+	got := find(r, "user lookup")
+	if len(got) != 2 || got[0].Level != Pass || !strings.Contains(got[0].Detail, "pk 12 (found by email") {
+		t.Fatalf("expected jo found by email, got %+v", got)
+	}
+	if got[1].Level != Fail || !strings.Contains(got[1].Detail, "name=pk") {
+		t.Fatalf("expected a FAIL suggesting name=pk for nobody, got %+v", got[1])
+	}
+}
+
+func TestPlexSharedUserWithoutNameShowsID(t *testing.T) {
+	const sharedXML = `<MediaContainer><SharedServer userID="77" username="" email="" allLibraries="1"><Section key="1" shared="1"/></SharedServer></MediaContainer>`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/identity":
+			fmt.Fprint(w, `{"MediaContainer":{"machineIdentifier":"abc","version":"1.43"}}`)
+		case "/library/sections":
+			fmt.Fprint(w, `{"MediaContainer":{"Directory":[]}}`)
+		case "/api/servers/abc/shared_servers":
+			fmt.Fprint(w, sharedXML)
+		default:
+			http.NotFound(w, req)
+		}
+	}))
+	defer srv.Close()
+	r := &Report{}
+	ProbePlex(context.Background(), PlexConfig{URL: srv.URL, Token: "t", PlexTV: srv.URL}, r)
+	s := find(r, "per-user sharing")
+	if len(s) != 1 || !strings.Contains(s[0].Detail, "Plex user #77: 1/1") || !strings.Contains(s[0].Detail, "1 with neither username nor email") {
+		t.Fatalf("unexpected sharing result: %+v", s)
+	}
+}
+
+// Seerr can take a long time to build request lists (it checks Radarr and
+// Sonarr), so the probe times them and reports a slow or hung list clearly.
+func TestSeerrSlowRequestListIsTimed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/api/v1/status":
+			fmt.Fprint(w, `{"version":"3.5.0"}`)
+		case "/api/v1/user":
+			fmt.Fprint(w, `{"pageInfo":{"results":1},"results":[{"id":2,"email":"jo@example.test","userType":1}]}`)
+		case "/api/v1/request":
+			time.Sleep(300 * time.Millisecond)
+			fmt.Fprint(w, `{"pageInfo":{"results":0},"results":[]}`)
+		default:
+			http.NotFound(w, req)
+		}
+	}))
+	defer srv.Close()
+	r := &Report{}
+	ProbeSeerr(context.Background(), SeerrConfig{URL: srv.URL, APIKey: "k", TestEmails: []string{"jo@example.test"}, RequestTimeout: 100 * time.Millisecond}, r)
+	speed := find(r, "request list speed")
+	if len(speed) != 1 || speed[0].Level != Warn || !strings.Contains(speed[0].Detail, "failed") {
+		t.Fatalf("expected a WARN noting the timeout, got %+v", speed)
+	}
+	if got := find(r, "own requests"); len(got) != 1 || got[0].Level != Fail {
+		t.Fatalf("expected own requests to FAIL after the timeout, got %+v", got)
+	}
+}
+
+func TestAuthentikNoUnboundAppsPasses(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/core/users/me/":
+			fmt.Fprint(w, `{"user":{"pk":9,"username":"sa"}}`)
+		case "/core/applications/":
+			fmt.Fprint(w, `{"pagination":{"next":0},"results":[]}`)
+		default:
+			http.Error(w, "forbidden", http.StatusForbidden)
+		}
+	}))
+	defer srv.Close()
+	r := &Report{}
+	ProbeAuthentik(context.Background(), AuthentikConfig{}, NewClient(srv.URL, nil, defaultTimeout), r)
+	if got := find(r, "apps without bindings"); len(got) != 1 || got[0].Level != Pass {
+		t.Fatalf("expected PASS when the token sees no open apps, got %+v", got)
+	}
+}
+
+func TestProgressGoesToCallbackNotReport(t *testing.T) {
+	var lines []string
+	r := &Report{Redact: true, Progress: func(l string) { lines = append(lines, l) }}
+	r.Step("Seerr: listing requests for %s", "jo@example.test")
+	r.Add("Seerr", "x", Pass, "done")
+	if len(lines) != 1 || lines[0] != "Seerr: listing requests for j***@example.test" {
+		t.Fatalf("unexpected progress lines: %q", lines)
+	}
+	if len(r.Results) != 1 {
+		t.Fatalf("progress leaked into the report: %+v", r.Results)
+	}
+	(&Report{}).Step("no callback set") // must not panic
 }
